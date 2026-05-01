@@ -1,3 +1,9 @@
+"""
+YouTube Audio Stream URL API
+Simple Flask API that returns direct audio stream URLs from YouTube videos.
+Ready to deploy on Render.
+"""
+
 import os
 import re
 from flask import Flask, request, jsonify
@@ -5,51 +11,89 @@ import yt_dlp
 
 app = Flask(__name__)
 
+
 def get_audio_stream_url(video_url):
+    """Extract the best audio-only stream URL from a YouTube video."""
     ydl_opts = {
         'quiet': True,
         'skip_download': True,
-        'cookiefile': 'cookies.[span_8](start_span)txt',
-        # Forces yt-dlp to use the iOS client, which often bypasses web-based bot checks[span_8](end_span)
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios'], 
-                'skip': ['webpage']
-            }
-        },
-        'format': 'bestaudio/best',
-        'nocheckcertificate': True,
+        'extract_flat': False,
+        'cookiefile': 'cookies.txt',
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            return {
-                'stream_url': info.get('url'),
-                'title': info.get('title'),
-                'format_id': info.get('format_id'),
-                'ext': info.get('ext'),
-                'abr': info.get('abr') or info.get('tbr'),
-                'duration': info.get('duration'),
-                'thumbnail': info.get('thumbnail'),
-            }
-    except Exception as e:
-        # Rethrow to be caught by the route handler
-        raise e
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+
+        # Find the best audio-only format
+        formats = info.get('formats', [])
+        audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+
+        if not audio_formats:
+            # Fallback: any format with audio
+            audio_formats = [f for f in formats if f.get('acodec') != 'none']
+
+        if not audio_formats:
+            return None
+
+        # Sort by quality (bitrate)
+        audio_formats.sort(key=lambda x: x.get('abr', 0) or x.get('tbr', 0) or 0, reverse=True)
+        best_audio = audio_formats[0]
+
+        return {
+            'stream_url': best_audio['url'],
+            'format_id': best_audio['format_id'],
+            'ext': best_audio['ext'],
+            'abr': best_audio.get('abr'),
+            'asr': best_audio.get('asr'),
+            'title': info.get('title'),
+            'duration': info.get('duration'),
+            'thumbnail': info.get('thumbnail'),
+        }
+
+
+@app.route('/')
+def home():
+    return jsonify({
+        'message': 'YouTube Audio Stream API',
+        'usage': 'GET /audio?url=YOUR_YOUTUBE_URL'
+    })
+
 
 @app.route('/audio', methods=['GET'])
 def get_audio():
     video_url = request.args.get('url')
-    if not video_url:
-        return jsonify({'error': "Missing 'url' parameter"}), 400
 
-    [span_9](start_span)try:
+    if not video_url:
+        return jsonify({'error': "Missing 'url' parameter. Usage: /audio?url=YOUR_YOUTUBE_URL"}), 400
+
+    # Basic URL validation
+    if not re.match(r'https?://(www\.)?(youtube\.com|youtu\.be)/.+', video_url):
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
+
+    try:
         result = get_audio_stream_url(video_url)
-        return jsonify({'success': True, **result})
+
+        if not result:
+            return jsonify({'error': 'No audio stream found'}), 404
+
+        return jsonify({
+            'success': True,
+            'title': result['title'],
+            'stream_url': result['stream_url'],
+            'format': {
+                'id': result['format_id'],
+                'ext': result['ext'],
+                'bitrate': result['abr'],
+                'sample_rate': result['asr'],
+            },
+            'duration': result['duration'],
+            'thumbnail': result['thumbnail'],
+        })
+
     except Exception as e:
-        # Detailed error message helps debug if it's an IP block[span_9](end_span)
         return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
