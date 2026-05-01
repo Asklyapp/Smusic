@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 def get_audio_stream_url(video_url):
     """Extract the best audio-only stream URL from a YouTube video."""
-        ydl_opts = {
+    ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
         'skip_download': True,
@@ -22,25 +22,24 @@ def get_audio_stream_url(video_url):
         'cookiefile': 'cookies.txt',
     }
 
-    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
-        
+
         # Find the best audio-only format
         formats = info.get('formats', [])
         audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-        
+
         if not audio_formats:
             # Fallback: any format with audio
             audio_formats = [f for f in formats if f.get('acodec') != 'none']
-        
+
         if not audio_formats:
             return None
-        
+
         # Sort by quality (bitrate)
         audio_formats.sort(key=lambda x: x.get('abr', 0) or x.get('tbr', 0) or 0, reverse=True)
         best_audio = audio_formats[0]
-        
+
         return {
             'stream_url': best_audio['url'],
             'format_id': best_audio['format_id'],
@@ -64,20 +63,20 @@ def home():
 @app.route('/audio', methods=['GET'])
 def get_audio():
     video_url = request.args.get('url')
-    
+
     if not video_url:
-        return jsonify({'error': 'Missing url parameter. Usage: /audio?url=YOUR_YOUTUBE_URL'}), 400
-    
+        return jsonify({'error': "Missing 'url' parameter. Usage: /audio?url=YOUR_YOUTUBE_URL"}), 400
+
     # Basic URL validation
     if not re.match(r'https?://(www\.)?(youtube\.com|youtu\.be)/.+', video_url):
         return jsonify({'error': 'Invalid YouTube URL'}), 400
-    
+
     try:
         result = get_audio_stream_url(video_url)
-        
+
         if not result:
             return jsonify({'error': 'No audio stream found'}), 404
-        
+
         return jsonify({
             'success': True,
             'title': result['title'],
@@ -91,7 +90,7 @@ def get_audio():
             'duration': result['duration'],
             'thumbnail': result['thumbnail'],
         })
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
