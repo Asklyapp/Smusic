@@ -13,30 +13,48 @@ app = Flask(__name__)
 
 
 def get_audio_stream_url(video_url):
+    """Extract the best audio-only stream URL from a YouTube video."""
     ydl_opts = {
         'quiet': True,
         'skip_download': True,
-        'format': 'bestaudio/best',  # ← let yt-dlp pick the best audio
+        'extract_flat': False,
         'cookiefile': 'cookies.txt',
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
 
-        # With format pre-selected, the requested format is in info directly
-        fmt = info.get('requested_formats', [info])[0]
+        # Find the best audio-only format
+        formats = info.get('formats', [])
+        audio_formats = [
+    f for f in formats
+    if f.get('acodec') != 'none'
+]
+
+if not audio_formats:
+    return None
+
+audio_formats.sort(
+    key=lambda x: (
+        x.get('abr') or 0,
+        x.get('tbr') or 0,
+        x.get('filesize') or 0
+    ),
+    reverse=True
+)
+
+best_audio = audio_formats[0]
 
         return {
-            'stream_url': fmt['url'],
-            'format_id': fmt['format_id'],
-            'ext': fmt['ext'],
-            'abr': fmt.get('abr'),
-            'asr': fmt.get('asr'),
+            'stream_url': best_audio['url'],
+            'format_id': best_audio['format_id'],
+            'ext': best_audio['ext'],
+            'abr': best_audio.get('abr'),
+            'asr': best_audio.get('asr'),
             'title': info.get('title'),
             'duration': info.get('duration'),
             'thumbnail': info.get('thumbnail'),
         }
-
 
 
 @app.route('/')
