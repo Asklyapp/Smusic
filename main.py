@@ -15,7 +15,6 @@ app = Flask(__name__)
 def get_audio_stream_url(video_url):
     """Extract the best audio-only stream URL from a YouTube video."""
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/bestaudio*',
         'quiet': True,
         'skip_download': True,
         'extract_flat': False,
@@ -25,12 +24,14 @@ def get_audio_stream_url(video_url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
 
-        # Find the best audio-only format
+        # Get all formats
         formats = info.get('formats', [])
+
+        # Find audio-only formats first
         audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
 
+        # If no pure audio, find any format with audio
         if not audio_formats:
-            # Fallback: any format with audio
             audio_formats = [f for f in formats if f.get('acodec') != 'none']
 
         if not audio_formats:
