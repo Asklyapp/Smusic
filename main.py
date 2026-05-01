@@ -14,12 +14,14 @@ app = Flask(__name__)
 
 def get_audio_stream_url(video_url):
     """Extract the best audio-only stream URL from a YouTube video."""
-    ydl_opts = {
+        ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
         'skip_download': True,
         'extract_flat': False,
+        'cookiefile': 'cookies.txt',
     }
+
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
