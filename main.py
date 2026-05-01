@@ -26,24 +26,18 @@ def get_audio_stream_url(video_url):
 
         # Find the best audio-only format
         formats = info.get('formats', [])
-        audio_formats = [
-    f for f in formats
-    if f.get('acodec') != 'none'
-]
+        audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
 
-if not audio_formats:
-    return None
+        if not audio_formats:
+            # Fallback: any format with audio
+            audio_formats = [f for f in formats if f.get('acodec') != 'none']
 
-audio_formats.sort(
-    key=lambda x: (
-        x.get('abr') or 0,
-        x.get('tbr') or 0,
-        x.get('filesize') or 0
-    ),
-    reverse=True
-)
+        if not audio_formats:
+            return None
 
-best_audio = audio_formats[0]
+        # Sort by quality (bitrate)
+        audio_formats.sort(key=lambda x: x.get('abr', 0) or x.get('tbr', 0) or 0, reverse=True)
+        best_audio = audio_formats[0]
 
         return {
             'stream_url': best_audio['url'],
