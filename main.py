@@ -1,15 +1,8 @@
 import os
 import re
 import subprocess
-import json
 from flask import Flask, request, Response
-
-try:
-    from curl_cffi import requests as curl_requests
-    CURL_CFFI_AVAILABLE = True
-except ImportError:
-    CURL_CFFI_AVAILABLE = False
-    import requests as curl_requests
+import yt_dlp
 
 app = Flask(__name__)
 
@@ -28,6 +21,7 @@ def search_youtube_music(query):
     if YTMUSIC_AVAILABLE:
         results = ytm.search(query, filter="songs", limit=1)
         if not results:
+            # Try without filter as fallback
             results = ytm.search(query, limit=1)
         if results:
             video_id = results[0].get("videoId")
@@ -35,169 +29,114 @@ def search_youtube_music(query):
                 return f"https://music.youtube.com/watch?v={video_id}"
         return None
     else:
+        # Fallback: use ytsearch with web_music client for music-biased results
         search_query = f"ytsearch1:{query}"
-        ydl_opts = [
-            "yt-dlp",
-            "--quiet",
-            "--skip-download",
-            "--extract-flat",
-            "--extractor-args", "youtube:player_client=web_music",
-            "--dump-single-json",
-            search_query,
-        ]
-        result = subprocess.run(ydl_opts, capture_output=True, text=True)
-        if result.returncode != 0:
-            return None
-        try:
-            info = json.loads(result.stdout)
-            entries = info.get("entries", [])
-            if entries:
-                return entries[0]["url"]
-        except json.JSONDecodeError:
-            return None
-        return None
+        ydl_opts = {
+            'quiet': True,
+            'skip_download': True,
+            'extract_flat': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web_music'],
+                },
+            },
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+            entries = info.get('entries', [])
+            if not entries:
+                return None
+            return entries[0]['url']
 
 
 def get_audio_stream_url(video_url):
-    """Extract the best audio stream URL using yt-dlp with iOS client to bypass PO tokens."""
-    # Use iOS client + combined format to avoid 403 on audio-only streams
-    ydl_opts = [
-        "yt-dlp",
-        "--quiet",
-        "--skip-download",
-        "--format", "best[acodec!=none]/bestaudio/best",
-        "--extractor-args", "youtube:player_client=ios;formats=missing_pot",
-        "--dump-single-json",
-        video_url,
-    ]
-    result = subprocess.run(ydl_opts, capture_output=True, text=True)
-    if result.returncode != 0:
-        return None, None
-    try:
-        info = json.loads(result.stdout)
-        url = info.get("url")
-        if not url:
-            # Fallback to formats array
-            formats = info.get("formats", [])
-            audio_formats = [f for f in formats if f.get("acodec") != "none"]
-            if not audio_formats:
-                return None, None
-            audio_formats.sort(
-                key=lambda x: x.get("abr", 0) or x.get("tbr", 0) or 0,
-                reverse=True,
-            )
-            url = audio_formats[0].get("url")
-        ext = info.get("ext", "webm")
-        return url, ext
-    except json.JSONDecodeError:
-        return None, None
+    """Extract the best audio-only stream URL from a YouTube video."""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'skip_download': True,
+        'extract_flat': False,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+        formats = info.get('formats', [])
+        audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+        if not audio_formats:
+            audio_formats = [f for f in formats if f.get('acodec') != 'none']
+        if not audio_formats:
+            return None
+        audio_formats.sort(key=lambda x: x.get('abr', 0) or x.get('tbr', 0) or 0, reverse=True)
+        return audio_formats[0]['url']
 
 
-@app.route("/")
+@app.route('/')
 def home():
     return "Usage: GET /audio?q=SONG+NAME+AND+ARTIST", 200
 
 
-@app.route("/audio", methods=["GET"])
+@app.route('/audio', methods=['GET'])
 def get_audio():
-    query = request.args.get("q")
+    query = request.args.get('q')
     if not query:
         return "Error: Missing q parameter", 400
 
     try:
-        if re.match(
-            r"https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+",
-            query,
-        ):
+        # If it looks like a URL, use it directly; otherwise search YouTube Music
+        if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
             video_url = query
         else:
             video_url = search_youtube_music(query)
             if not video_url:
                 return "Error: No search results found", 404
 
-        stream_url, ext = get_audio_stream_url(video_url)
-        if not stream_url:
-            return "Error: No audio stream found", 404
+        # Instead of extracting a URL and proxying it (which fails due to IP-locking),
+        # we stream the audio directly through yt-dlp to stdout and pipe it to the client.
+        # yt-dlp handles all headers, cookies, and anti-bot measures internally.
+        # This is the official recommended approach per yt-dlp FAQ.
+        cmd = [
+            'yt-dlp',
+            '-f', 'bestaudio/best',
+            '-o', '-',           # output to stdout
+            '--no-playlist',
+            '--quiet',
+            '--no-warnings',
+            '--extractor-args', 'youtube:player_client=ios;formats=missing_pot',
+            video_url,
+        ]
 
-        # Use curl_cffi with Chrome impersonation to match real browser TLS fingerprint
-        range_header = request.headers.get("Range")
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "identity",
-            "Referer": "https://music.youtube.com/",
-            "Origin": "https://music.youtube.com",
-            "Connection": "keep-alive",
-        }
-        if range_header:
-            headers["Range"] = range_header
-
-        if CURL_CFFI_AVAILABLE:
-            youtube_response = curl_requests.get(
-                stream_url,
-                headers=headers,
-                stream=True,
-                timeout=30,
-                impersonate="chrome120",
-            )
-        else:
-            youtube_response = curl_requests.get(
-                stream_url,
-                headers=headers,
-                stream=True,
-                timeout=30,
-            )
-
-        if youtube_response.status_code not in (200, 206):
-            return (
-                f"Error: Upstream returned {youtube_response.status_code}",
-                502,
-            )
+        # Start yt-dlp process
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
         def generate():
-            for chunk in youtube_response.iter_content(chunk_size=64 * 1024):
-                if chunk:
+            try:
+                while True:
+                    chunk = process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
                     yield chunk
+            finally:
+                process.stdout.close()
+                process.wait()
 
-        content_type = youtube_response.headers.get("Content-Type")
-        if not content_type:
-            content_type = f"audio/{ext}" if ext else "audio/webm"
-
+        # Determine content type based on format preference
+        # yt-dlp bestaudio usually returns webm (opus) or m4a (aac)
         response = Response(
             generate(),
-            status=youtube_response.status_code,
-            content_type=content_type,
+            content_type='audio/webm',
         )
 
-        for h in (
-            "Content-Range",
-            "Accept-Ranges",
-            "Content-Length",
-            "Cache-Control",
-            "ETag",
-            "Last-Modified",
-        ):
-            val = youtube_response.headers.get(h)
-            if val:
-                response.headers[h] = val
-
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Expose-Headers"] = (
-            "Content-Range, Accept-Ranges, Content-Length"
-        )
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Accept-Ranges'] = 'none'  # yt-dlp stdout doesn't support seeking
         return response
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return f"Error: {str(e)}", 500
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
