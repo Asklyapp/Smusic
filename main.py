@@ -5,33 +5,58 @@ from flask import Flask, request, Response
 
 app = Flask(__name__)
 
-# Piped instance - these are volunteer-run proxies that handle YouTube extraction
-# You can swap this out if it goes down. List: https://github.com/TeamPiped/Piped/wiki/Instances
-PIPED_API = "https://pipedapi.kavin.rocks"
+# Multiple Piped instances - if one fails, we can rotate
+# List from https://piped-instances.kavin.rocks/
+PIPED_INSTANCES = [
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.nosebs.ru",
+    "https://pipedapi.ducks.party",
+    "https://pipedapi.reallyaweso.me",
+    "https://api.piped.private.coffee",
+    "https://pipedapi.darkness.services",
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi-libre.kavin.rocks",
+]
 
 
 def search_piped(query):
     """Search for music via Piped API and return the first result video ID."""
-    try:
-        resp = requests.get(
-            f"{PIPED_API}/search",
-            params={"q": query, "filter": "music_songs"},
-            timeout=10
-        )
-        resp.raise_for_status()
-        results = resp.json().get("items", [])
-        if results:
-            return results[0].get("url")  # e.g. /watch?v=VIDEO_ID
-        return None
-    except Exception:
-        return None
+    for instance in PIPED_INSTANCES:
+        try:
+            resp = requests.get(
+                f"{instance}/search",
+                params={"q": query},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("items", [])
+
+            # Try to find a music/video result
+            for item in items:
+                url = item.get("url", "")
+                if "/watch?v=" in url:
+                    video_id = url.split("v=")[-1].split("&")[0]
+                    return video_id, instance
+
+            # Fallback: just take first result
+            if items:
+                url = items[0].get("url", "")
+                if "/watch?v=" in url:
+                    video_id = url.split("v=")[-1].split("&")[0]
+                    return video_id, instance
+
+        except Exception:
+            continue
+
+    return None, None
 
 
-def get_audio_stream(video_id):
+def get_audio_stream(video_id, instance):
     """Get direct audio stream URL from Piped for a given video ID."""
     try:
         resp = requests.get(
-            f"{PIPED_API}/streams/{video_id}",
+            f"{instance}/streams/{video_id}",
             timeout=10
         )
         resp.raise_for_status()
@@ -65,16 +90,16 @@ def get_audio():
         )
         if url_match:
             video_id = url_match.group(3)
+            # Use first instance for stream lookup
+            instance = PIPED_INSTANCES[0]
         else:
             # Search Piped for the song
-            video_url = search_piped(query)
-            if not video_url:
+            video_id, instance = search_piped(query)
+            if not video_id:
                 return "Error: No search results found", 404
-            # Extract video ID from /watch?v=VIDEO_ID
-            video_id = video_url.split("v=")[-1] if "v=" in video_url else video_url.split("/")[-1]
 
         # Get direct audio stream URL from Piped
-        stream_url = get_audio_stream(video_id)
+        stream_url = get_audio_stream(video_id, instance)
         if not stream_url:
             return "Error: No audio stream found", 404
 
