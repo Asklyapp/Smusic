@@ -6,9 +6,9 @@ import yt_dlp
 app = Flask(__name__)
 
 
-def search_youtube(query):
-    """Search YouTube for a query and return the top result video URL."""
-    search_query = f"ytsearch1:{query}"
+def search_youtube_music(query):
+    """Search YouTube Music for a query and return the top result video URL."""
+    search_query = f"ytmsearch1:{query}"
     ydl_opts = {
         'quiet': True,
         'skip_download': True,
@@ -54,11 +54,11 @@ def get_audio():
         return "Error: Missing q parameter", 400
 
     try:
-        # If it looks like a URL, use it directly; otherwise search
-        if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be)/.+', query):
+        # If it looks like a URL, use it directly; otherwise search YouTube Music
+        if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
             video_url = query
         else:
-            video_url = search_youtube(query)
+            video_url = search_youtube_music(query)
             if not video_url:
                 return "Error: No search results found", 404
 
