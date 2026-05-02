@@ -1,5 +1,6 @@
 import os
 import re
+import requests
 from flask import Flask, request, Response
 import yt_dlp
 
@@ -92,7 +93,37 @@ def get_audio():
         if not stream_url:
             return "Error: No audio stream found", 404
 
-        response = Response(stream_url, mimetype='text/plain')
+        # Determine the Range header to forward (for seeking support)
+        range_header = request.headers.get('Range')
+        headers = {}
+        if range_header:
+            headers['Range'] = range_header
+
+        # Stream the audio from YouTube through the server
+        youtube_response = requests.get(
+            stream_url,
+            headers=headers,
+            stream=True,
+            timeout=30
+        )
+
+        # Build a Flask Response that proxies the stream
+        def generate():
+            for chunk in youtube_response.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+
+        response = Response(
+            generate(),
+            status=youtube_response.status_code,
+            content_type=youtube_response.headers.get('Content-Type', 'audio/webm')
+        )
+
+        # Forward important headers for playback/seeking
+        for h in ('Content-Range', 'Accept-Ranges', 'Content-Length', 'Cache-Control'):
+            if h in youtube_response.headers:
+                response.headers[h] = youtube_response.headers[h]
+
         response.headers['Access-Control-Allow-Origin'] = '*'
         return response
 
