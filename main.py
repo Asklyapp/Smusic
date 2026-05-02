@@ -5,21 +5,47 @@ import yt_dlp
 
 app = Flask(__name__)
 
+# Try to import ytmusicapi; if not installed, fall back to ytsearch with web_music
+YTMUSIC_AVAILABLE = False
+try:
+    from ytmusicapi import YTMusic
+    ytm = YTMusic()
+    YTMUSIC_AVAILABLE = True
+except ImportError:
+    ytm = None
+
 
 def search_youtube_music(query):
     """Search YouTube Music for a query and return the top result video URL."""
-    search_query = f"ytmsearch1:{query}"
-    ydl_opts = {
-        'quiet': True,
-        'skip_download': True,
-        'extract_flat': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(search_query, download=False)
-        entries = info.get('entries', [])
-        if not entries:
-            return None
-        return entries[0]['url']
+    if YTMUSIC_AVAILABLE:
+        results = ytm.search(query, filter="songs", limit=1)
+        if not results:
+            # Try without filter as fallback
+            results = ytm.search(query, limit=1)
+        if results:
+            video_id = results[0].get("videoId")
+            if video_id:
+                return f"https://music.youtube.com/watch?v={video_id}"
+        return None
+    else:
+        # Fallback: use ytsearch with web_music client for music-biased results
+        search_query = f"ytsearch1:{query}"
+        ydl_opts = {
+            'quiet': True,
+            'skip_download': True,
+            'extract_flat': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web_music'],
+                },
+            },
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+            entries = info.get('entries', [])
+            if not entries:
+                return None
+            return entries[0]['url']
 
 
 def get_audio_stream_url(video_url):
