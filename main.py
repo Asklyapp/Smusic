@@ -28,13 +28,15 @@ def search_youtube_music(query):
     else:
         search_query = f"ytsearch1:{query}"
         ydl_opts = {
-            'quiet': True,
-            'skip_download': True,
-            'extract_flat': True,
-            'extractor_args': {
-                'youtube': {'player_client': ['web_music']},
-            },
-        }
+    'quiet': True,
+    'skip_download': True,
+    'extract_flat': True,
+    'cookiefile': 'cookies.txt',  # ADD THIS
+    'extractor_args': {
+        'youtube': {'player_client': ['web_music']},
+    },
+}
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(search_query, download=False)
             entries = info.get('entries', [])
@@ -45,11 +47,13 @@ def search_youtube_music(query):
 
 def get_audio_stream_url(video_url):
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'skip_download': True,
-        'extract_flat': False,
-    }
+    'format': 'bestaudio/best',
+    'quiet': True,
+    'skip_download': True,
+    'extract_flat': False,
+    'cookiefile': 'cookies.txt',  # ADD THIS
+}
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         formats = info.get('formats', [])
