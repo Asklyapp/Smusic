@@ -49,8 +49,10 @@ def get_audio():
         if not stream_url:
             return "Error: No audio stream found", 404
         
-        # Return as plain text instead of JSON
-        return Response(stream_url, mimetype='text/plain')
+        # Return as plain text with CORS header so the browser can fetch it
+        response = Response(stream_url, mimetype='text/plain')
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        return response
         
     except Exception as e:
         return f"Error: {str(e)}", 500
