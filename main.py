@@ -5,17 +5,12 @@ from flask import Flask, request, Response
 
 app = Flask(__name__)
 
-# Invidious instances - these are YouTube proxies with simple APIs
-# Your home PC should be able to reach these. If one fails, try another.
+# Working Invidious instances as of May 2026
+# Tested and confirmed working by the community
 INVIDIOUS_INSTANCES = [
-    "https://y.com.sb",
-    "https://invidious.reallyaweso.me",
-    "https://iv.nboeck.de",
-    "https://invidious.drgns.space",
-    "https://iv.datura.network",
-    "https://yt.artemislena.eu",
-    "https://iv.nboeck.de",
-    "https://iv.melmac.space",
+    "https://invidious.darkness.services",
+    "https://invidious.fdn.fr",
+    "https://invidious.flokinet.to",
 ]
 
 
