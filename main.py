@@ -5,69 +5,68 @@ from flask import Flask, request, Response
 
 app = Flask(__name__)
 
-# Multiple Piped instances - if one fails, we can rotate
-# List from https://piped-instances.kavin.rocks/
-PIPED_INSTANCES = [
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.nosebs.ru",
-    "https://pipedapi.ducks.party",
-    "https://pipedapi.reallyaweso.me",
-    "https://api.piped.private.coffee",
-    "https://pipedapi.darkness.services",
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi-libre.kavin.rocks",
+# Invidious instances - these are YouTube proxies with simple APIs
+# Your home PC should be able to reach these. If one fails, try another.
+INVIDIOUS_INSTANCES = [
+    "https://y.com.sb",
+    "https://invidious.reallyaweso.me",
+    "https://iv.nboeck.de",
+    "https://invidious.drgns.space",
+    "https://iv.datura.network",
+    "https://yt.artemislena.eu",
+    "https://iv.nboeck.de",
+    "https://iv.melmac.space",
 ]
 
 
-def search_piped(query):
-    """Search for music via Piped API and return the first result video ID."""
-    for instance in PIPED_INSTANCES:
+def search_invidious(query):
+    """Search for music via Invidious API and return the first result video ID."""
+    for instance in INVIDIOUS_INSTANCES:
         try:
             resp = requests.get(
-                f"{instance}/search",
-                params={"q": query},
-                timeout=10
+                f"{instance}/api/v1/search",
+                params={"q": query, "type": "video"},
+                timeout=15
             )
             resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items", [])
-
-            # Try to find a music/video result
-            for item in items:
-                url = item.get("url", "")
-                if "/watch?v=" in url:
-                    video_id = url.split("v=")[-1].split("&")[0]
+            results = resp.json()
+            if results and len(results) > 0:
+                video_id = results[0].get("videoId")
+                if video_id:
                     return video_id, instance
-
-            # Fallback: just take first result
-            if items:
-                url = items[0].get("url", "")
-                if "/watch?v=" in url:
-                    video_id = url.split("v=")[-1].split("&")[0]
-                    return video_id, instance
-
-        except Exception:
+        except Exception as e:
+            print(f"[search] {instance} failed: {e}")
             continue
-
     return None, None
 
 
 def get_audio_stream(video_id, instance):
-    """Get direct audio stream URL from Piped for a given video ID."""
+    """Get direct audio stream URL from Invidious for a given video ID."""
     try:
         resp = requests.get(
-            f"{instance}/streams/{video_id}",
-            timeout=10
+            f"{instance}/api/v1/videos/{video_id}",
+            timeout=15
         )
         resp.raise_for_status()
         data = resp.json()
-        audio_streams = data.get("audioStreams", [])
-        if not audio_streams:
+
+        # adaptiveFormats contains separate audio and video streams
+        formats = data.get("adaptiveFormats", [])
+        audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
+
+        if not audio_formats:
+            # Fallback: try all formats and filter by mime type
+            formats = data.get("formatStreams", [])
+            audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
+
+        if not audio_formats:
             return None
+
         # Sort by bitrate, highest first
-        audio_streams.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
-        return audio_streams[0].get("url")
-    except Exception:
+        audio_formats.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+        return audio_formats[0].get("url")
+    except Exception as e:
+        print(f"[stream] {instance} failed for {video_id}: {e}")
         return None
 
 
@@ -90,15 +89,14 @@ def get_audio():
         )
         if url_match:
             video_id = url_match.group(3)
-            # Use first instance for stream lookup
-            instance = PIPED_INSTANCES[0]
+            instance = INVIDIOUS_INSTANCES[0]
         else:
-            # Search Piped for the song
-            video_id, instance = search_piped(query)
+            # Search Invidious for the song
+            video_id, instance = search_invidious(query)
             if not video_id:
-                return "Error: No search results found", 404
+                return "Error: No search results found (all Invidious instances failed)", 404
 
-        # Get direct audio stream URL from Piped
+        # Get direct audio stream URL from Invidious
         stream_url = get_audio_stream(video_id, instance)
         if not stream_url:
             return "Error: No audio stream found", 404
@@ -109,6 +107,8 @@ def get_audio():
         return response
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return f"Error: {str(e)}", 500
 
 
