@@ -1,16 +1,9 @@
-"""
-YouTube Audio Stream URL API
-Simple Flask API that returns direct audio stream URLs from YouTube videos.
-Ready to deploy on Render.
-"""
-
 import os
 import re
-from flask import Flask, request, jsonify
+from flask import Flask, request, Response
 import yt_dlp
 
 app = Flask(__name__)
-
 
 def get_audio_stream_url(video_url):
     """Extract the best audio-only stream URL from a YouTube video."""
@@ -23,77 +16,45 @@ def get_audio_stream_url(video_url):
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
-        
-        # Find the best audio-only format
         formats = info.get('formats', [])
         audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
         
         if not audio_formats:
-            # Fallback: any format with audio
             audio_formats = [f for f in formats if f.get('acodec') != 'none']
         
         if not audio_formats:
             return None
         
-        # Sort by quality (bitrate)
+        # Sort by quality and grab the best one
         audio_formats.sort(key=lambda x: x.get('abr', 0) or x.get('tbr', 0) or 0, reverse=True)
-        best_audio = audio_formats[0]
-        
-        return {
-            'stream_url': best_audio['url'],
-            'format_id': best_audio['format_id'],
-            'ext': best_audio['ext'],
-            'abr': best_audio.get('abr'),
-            'asr': best_audio.get('asr'),
-            'title': info.get('title'),
-            'duration': info.get('duration'),
-            'thumbnail': info.get('thumbnail'),
-        }
-
+        return audio_formats[0]['url']
 
 @app.route('/')
 def home():
-    return jsonify({
-        'message': 'YouTube Audio Stream API',
-        'usage': 'GET /audio?url=YOUR_YOUTUBE_URL'
-    })
-
+    return "Usage: GET /audio?url=YOUR_YOUTUBE_URL", 200
 
 @app.route('/audio', methods=['GET'])
 def get_audio():
     video_url = request.args.get('url')
     
     if not video_url:
-        return jsonify({'error': 'Missing url parameter. Usage: /audio?url=YOUR_YOUTUBE_URL'}), 400
+        return "Error: Missing url parameter", 400
     
-    # Basic URL validation
     if not re.match(r'https?://(www\.)?(youtube\.com|youtu\.be)/.+', video_url):
-        return jsonify({'error': 'Invalid YouTube URL'}), 400
+        return "Error: Invalid YouTube URL", 400
     
     try:
-        result = get_audio_stream_url(video_url)
+        stream_url = get_audio_stream_url(video_url)
         
-        if not result:
-            return jsonify({'error': 'No audio stream found'}), 404
+        if not stream_url:
+            return "Error: No audio stream found", 404
         
-        return jsonify({
-            'success': True,
-            'title': result['title'],
-            'stream_url': result['stream_url'],
-            'format': {
-                'id': result['format_id'],
-                'ext': result['ext'],
-                'bitrate': result['abr'],
-                'sample_rate': result['asr'],
-            },
-            'duration': result['duration'],
-            'thumbnail': result['thumbnail'],
-        })
+        # Return as plain text instead of JSON
+        return Response(stream_url, mimetype='text/plain')
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
+        return f"Error: {str(e)}", 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port)
