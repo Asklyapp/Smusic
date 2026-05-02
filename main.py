@@ -21,7 +21,6 @@ def search_youtube_music(query):
     if YTMUSIC_AVAILABLE:
         results = ytm.search(query, filter="songs", limit=1)
         if not results:
-            # Try without filter as fallback
             results = ytm.search(query, limit=1)
         if results:
             video_id = results[0].get("videoId")
@@ -29,7 +28,6 @@ def search_youtube_music(query):
                 return f"https://music.youtube.com/watch?v={video_id}"
         return None
     else:
-        # Fallback: use ytsearch with web_music client for music-biased results
         search_query = f"ytsearch1:{query}"
         ydl_opts = {
             'quiet': True,
@@ -81,7 +79,6 @@ def get_audio():
         return "Error: Missing q parameter", 400
 
     try:
-        # If it looks like a URL, use it directly; otherwise search YouTube Music
         if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
             video_url = query
         else:
@@ -93,23 +90,39 @@ def get_audio():
         if not stream_url:
             return "Error: No audio stream found", 404
 
-        # Determine the Range header to forward (for seeking support)
-        range_header = request.headers.get('Range')
-        headers = {}
-        if range_header:
-            headers['Range'] = range_header
+        # Build headers to mimic a real browser — critical for YouTube not to 403 us
+        youtube_headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/120.0.0.0 Safari/537.36'
+            ),
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'identity',  # avoid gzip so we can stream raw bytes
+            'Referer': 'https://music.youtube.com/',
+            'Origin': 'https://music.youtube.com',
+            'Connection': 'keep-alive',
+        }
 
-        # Stream the audio from YouTube through the server
+        range_header = request.headers.get('Range')
+        if range_header:
+            youtube_headers['Range'] = range_header
+
         youtube_response = requests.get(
             stream_url,
-            headers=headers,
+            headers=youtube_headers,
             stream=True,
             timeout=30
         )
 
-        # Build a Flask Response that proxies the stream
+        # If YouTube rejects us, log it and return the error
+        if youtube_response.status_code not in (200, 206):
+            return f"Error: Upstream returned {youtube_response.status_code}", 502
+
         def generate():
-            for chunk in youtube_response.iter_content(chunk_size=8192):
+            # Use raw stream to avoid requests decoding chunks
+            for chunk in youtube_response.iter_content(chunk_size=64 * 1024):
                 if chunk:
                     yield chunk
 
@@ -119,15 +132,19 @@ def get_audio():
             content_type=youtube_response.headers.get('Content-Type', 'audio/webm')
         )
 
-        # Forward important headers for playback/seeking
-        for h in ('Content-Range', 'Accept-Ranges', 'Content-Length', 'Cache-Control'):
-            if h in youtube_response.headers:
-                response.headers[h] = youtube_response.headers[h]
+        # Forward headers that matter for media playback
+        for h in ('Content-Range', 'Accept-Ranges', 'Content-Length', 'Cache-Control', 'ETag', 'Last-Modified'):
+            val = youtube_response.headers.get(h)
+            if val:
+                response.headers[h] = val
 
         response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Expose-Headers'] = 'Content-Range, Accept-Ranges, Content-Length'
         return response
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return f"Error: {str(e)}", 500
 
 
