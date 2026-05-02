@@ -32,7 +32,7 @@ def search_youtube_music(query):
             'skip_download': True,
             'extract_flat': True,
             'extractor_args': {
-                'youtube': {'player_client': ['ios']},
+                'youtube': {'player_client': ['web_music']},
             },
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -49,10 +49,6 @@ def get_audio_stream_url(video_url):
         'quiet': True,
         'skip_download': True,
         'extract_flat': False,
-        # iOS client does NOT need a JS runtime — fixes your warning
-        'extractor_args': {
-            'youtube': {'player_client': ['ios']},
-        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
@@ -108,7 +104,6 @@ def get_audio():
                 resp_headers[h] = val
 
         def generate():
-            # 64KB chunks — big enough to be fast, small enough to start playing instantly
             for chunk in upstream.iter_content(chunk_size=65536):
                 if chunk:
                     yield chunk
