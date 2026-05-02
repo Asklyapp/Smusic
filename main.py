@@ -1,5 +1,6 @@
 import os
 import re
+import tempfile
 import requests
 from flask import Flask, request, Response, stream_with_context
 import yt_dlp
@@ -15,6 +16,16 @@ except ImportError:
     ytm = None
 
 
+def get_cookies_file():
+    cookies = os.environ.get('COOKIES', '')
+    if not cookies:
+        return None
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+    tmp.write(cookies)
+    tmp.flush()
+    return tmp.name
+
+
 def search_youtube_music(query):
     if YTMUSIC_AVAILABLE:
         results = ytm.search(query, filter="songs", limit=1)
@@ -28,15 +39,14 @@ def search_youtube_music(query):
     else:
         search_query = f"ytsearch1:{query}"
         ydl_opts = {
-    'quiet': True,
-    'skip_download': True,
-    'extract_flat': True,
-    'cookiefile': 'cookies.txt',  # ADD THIS
-    'extractor_args': {
-        'youtube': {'player_client': ['web_music']},
-    },
-}
-
+            'quiet': True,
+            'skip_download': True,
+            'extract_flat': True,
+            'cookiefile': get_cookies_file(),
+            'extractor_args': {
+                'youtube': {'player_client': ['web_music']},
+            },
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(search_query, download=False)
             entries = info.get('entries', [])
@@ -47,13 +57,12 @@ def search_youtube_music(query):
 
 def get_audio_stream_url(video_url):
     ydl_opts = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'skip_download': True,
-    'extract_flat': False,
-    'cookiefile': 'cookies.txt',  # ADD THIS
-}
-
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'skip_download': True,
+        'extract_flat': False,
+        'cookiefile': get_cookies_file(),
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         formats = info.get('formats', [])
