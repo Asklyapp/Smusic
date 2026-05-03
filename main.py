@@ -16,9 +16,7 @@ BOT_TOKEN = "8749662350:AAFaCiUaVcmc20hSLkEc3pGlf1p4NlG7wU8"
 CHAT_ID = "-1003992096916"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Telegram bots can send files up to 50 MB via sendDocument.
-# Audio files above this need sendAudio which also has a 50 MB cap.
-TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB hard cap for Telegram bots
 
 # ── Upload tracking ───────────────────────────────────────────────────────
 _uploading: set = set()
@@ -108,73 +106,69 @@ def resolve(query: str, cache_key: str):
     return url, ct
 
 
-# ── Telegram upload ───────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────
 
 def log(msg: str):
-    """Flushed print so output always appears immediately in logs."""
     print(msg, flush=True)
 
+
+# ── Telegram upload ───────────────────────────────────────────────────────
 
 def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str, content_type: str):
     try:
         size = buffer.tell()
-        log(f"[TELEGRAM] ── Upload starting for '{query}' ({size:,} bytes) ──")
+        log(f"[TELEGRAM] ── Starting upload for '{query}' ({size:,} bytes) ──")
 
         if size < 1024:
-            log(f"[TELEGRAM] ❌ Skipping — file too small ({size} bytes)")
+            log(f"[TELEGRAM] ❌ Skipping — too small ({size} bytes)")
             return
 
         if size > TELEGRAM_MAX_BYTES:
-            log(f"[TELEGRAM] ❌ Skipping — file too large ({size:,} bytes > 50 MB Telegram limit)")
+            log(f"[TELEGRAM] ❌ Skipping — too large ({size:,} bytes, Telegram cap is 50 MB)")
             return
 
         ext = ('webm' if 'webm' in content_type else
                'm4a'  if 'mp4'  in content_type else
                'mp3'  if 'mpeg' in content_type else 'webm')
         filename = f"{query.replace(' ', '_')}.{ext}"
-        log(f"[TELEGRAM] Filename: {filename}")
+        log(f"[TELEGRAM] Uploading as '{filename}'…")
 
         buffer.seek(0)
-        log(f"[TELEGRAM] Calling Telegram API…")
-
-        url = f"{TELEGRAM_API}/sendDocument"
         resp = requests.post(
-            url,
+            f"{TELEGRAM_API}/sendDocument",
             data={"chat_id": CHAT_ID},
             files={"document": (filename, buffer)},
-            timeout=300,   # 5-minute cap — large files can be slow
+            timeout=300,
         )
 
-        log(f"[TELEGRAM] HTTP {resp.status_code} received")
+        log(f"[TELEGRAM] HTTP {resp.status_code}")
         result = resp.json()
-        log(f"[TELEGRAM] API response: {result}")
 
         if result.get("ok"):
             file_id = result["result"]["document"]["file_id"]
-            log(f"[TELEGRAM] ✅ Upload succeeded! file_id={file_id}")
+            log(f"[TELEGRAM] ✅ Success! file_id={file_id}")
             log(f"[TELEGRAM] 💾 Supabase → query='{query}', file_id='{file_id}'")
         else:
-            log(f"[TELEGRAM] ❌ API error: {result.get('description', 'unknown')}")
+            log(f"[TELEGRAM] ❌ API error: {result.get('description', result)}")
 
     except requests.exceptions.Timeout:
         log(f"[TELEGRAM] ❌ Timed out uploading '{query}'")
     except Exception as exc:
-        log(f"[TELEGRAM] ❌ Unexpected exception: {type(exc).__name__}: {exc}")
+        log(f"[TELEGRAM] ❌ Exception: {type(exc).__name__}: {exc}")
     finally:
         buffer.close()
         with _upload_lock:
             _uploading.discard(cache_key)
-        log(f"[TELEGRAM] ── Upload thread done for '{query}' ──")
+        log(f"[TELEGRAM] ── Upload thread finished for '{query}' ──")
 
 
 # ── Core proxy ────────────────────────────────────────────────────────────
 CHUNK = 8 * 1024
-QUEUE_MAX = 64
 _SENTINEL = object()
 
 
 def _proxy(stream_url: str, content_type: str):
-    """Plain proxy for range/seek requests — no upload side-effect."""
+    """Plain proxy for range/seek requests — no upload."""
     upstream_headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
     if 'Range' in request.headers:
         upstream_headers['Range'] = request.headers['Range']
@@ -205,24 +199,30 @@ def _proxy(stream_url: str, content_type: str):
 def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     """
     ONE CDN request:
-      • streams to the client as bytes arrive (no startup delay)
-      • buffers every byte
-      • after the FULL download completes, uploads the buffer to Telegram
-    Client disconnecting early has zero effect on the download/upload.
+      • client gets chunks streamed in real time (no startup delay)
+      • every byte is also written to a buffer
+      • after the full download completes, the buffer is uploaded to Telegram
+
+    KEY FIX: the queue is unbounded (no maxsize).
+    Previously a bounded queue would fill up when the client disconnected,
+    causing chunk_queue.put(_SENTINEL) in the finally block to block forever —
+    so the upload code after it never ran. Unbounded queue means puts never
+    block, sentinel always gets through, upload always runs.
     """
     cache_key = query.lower()
 
     if 'Range' in request.headers:
-        log(f"[PROXY] Range request — plain proxy for: {query}")
+        log(f"[PROXY] Range request — plain proxy: {query}")
         return _proxy(stream_url, content_type)
 
     with _upload_lock:
         if cache_key in _uploading:
-            log(f"[PROXY] Upload already running for: {query}")
+            log(f"[PROXY] Already uploading: {query}")
             return _proxy(stream_url, content_type)
         _uploading.add(cache_key)
 
-    chunk_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
+    # ── Unbounded queue — puts NEVER block ───────────────────────────────
+    chunk_queue: queue.Queue = queue.Queue()  # no maxsize!
     buffer = io.BytesIO()
 
     def downloader():
@@ -236,22 +236,20 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
             for chunk in resp.iter_content(chunk_size=CHUNK):
                 if not chunk:
                     continue
-                buffer.write(chunk)
-                try:
-                    chunk_queue.put_nowait(chunk)
-                except queue.Full:
-                    pass  # client gone — keep downloading
+                buffer.write(chunk)       # buffer for Telegram
+                chunk_queue.put(chunk)    # never blocks — queue is unbounded
 
             download_ok = True
             log(f"[PROXY] ✅ Full download complete — {buffer.tell():,} bytes — '{query}'")
 
         except Exception as exc:
-            log(f"[PROXY] ❌ Download error for '{query}': {type(exc).__name__}: {exc}")
+            log(f"[PROXY] ❌ Download error '{query}': {type(exc).__name__}: {exc}")
         finally:
-            chunk_queue.put(_SENTINEL)
+            chunk_queue.put(_SENTINEL)   # always unblocks the generator
 
-        # Upload runs in this same background thread right after download
+        # This always runs now — sentinel never gets stuck
         if download_ok:
+            log(f"[PROXY] Handing off to Telegram uploader…")
             _upload_to_telegram(buffer, query, cache_key, content_type)
         else:
             buffer.close()
@@ -272,7 +270,7 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
             try:
                 chunk = chunk_queue.get(timeout=60)
             except queue.Empty:
-                log(f"[PROXY] Queue timeout for: {query}")
+                log(f"[PROXY] Queue timeout — ending client stream: {query}")
                 break
             if chunk is _SENTINEL:
                 break
