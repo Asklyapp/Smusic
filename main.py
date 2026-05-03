@@ -7,21 +7,26 @@ import io
 import requests
 from flask import Flask, request, Response, stream_with_context
 import yt_dlp
-from supabase import create_client, Client
 
 app = Flask(__name__)
 
-# ── Supabase ──────────────────────────────────────────────────────────────
+# ── Supabase REST config ──────────────────────────────────────────────────
 SUPABASE_URL = "https://bzlbyagjpblzgeiixyud.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ6bGJ5YWdqcGJsemdlaWl4eXVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzMDEwMTYsImV4cCI6MjA4ODg3NzAxNn0.HJp0_O2jf286nFwaQwecn0M1OIuNu9TDz_S3RBwXDZM"
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_HEADERS = {
+    "apikey":        SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type":  "application/json",
+    "Prefer":        "return=minimal",
+}
+SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/songs"
 
 # ── Telegram config ───────────────────────────────────────────────────────
 BOT_TOKEN    = "8749662350:AAFaCiUaVcmc20hSLkEc3pGlf1p4NlG7wU8"
 CHAT_ID      = "-1003992096916"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
+TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # ── Upload tracking ───────────────────────────────────────────────────────
 _uploading: set = set()
@@ -50,53 +55,59 @@ def log(msg: str):
     print(msg, flush=True)
 
 
-# ── Supabase helpers ──────────────────────────────────────────────────────
+# ── Supabase REST helpers ─────────────────────────────────────────────────
 
 def supabase_lookup(query: str) -> dict | None:
     """
     Check Supabase for a previously uploaded song.
-    Returns the row dict (with file_id, content_type) or None.
-    Tries exact query match first, then title+artist split.
+    Returns the row dict or None.
+    Tries exact query match first, then artist+title split.
     """
     try:
         q = query.strip().lower()
 
-        # 1. Exact query match
-        res = (supabase.table("songs")
-               .select("*")
-               .ilike("query", q)
-               .limit(1)
-               .execute())
-        if res.data:
+        # 1. Exact query match (case-insensitive via ilike)
+        resp = requests.get(
+            SUPABASE_TABLE,
+            headers=SUPABASE_HEADERS,
+            params={"query": f"ilike.{q}", "limit": 1},
+            timeout=5,
+        )
+        rows = resp.json()
+        if isinstance(rows, list) and rows:
             log(f"[SUPABASE] ✅ Cache hit (query): {query}")
-            return res.data[0]
+            return rows[0]
 
-        # 2. Try splitting "artist - title" or "title artist" styles
-        #    and match on title + artist columns
+        # 2. Try artist+title split on "artist - title" style queries
         parts = re.split(r'\s*-\s*', q, maxsplit=1)
         if len(parts) == 2:
             artist, title = parts[0].strip(), parts[1].strip()
-            res = (supabase.table("songs")
-                   .select("*")
-                   .ilike("artist", f"%{artist}%")
-                   .ilike("title",  f"%{title}%")
-                   .limit(1)
-                   .execute())
-            if res.data:
-                log(f"[SUPABASE] ✅ Cache hit (title+artist): {query}")
-                return res.data[0]
+            resp = requests.get(
+                SUPABASE_TABLE,
+                headers=SUPABASE_HEADERS,
+                params={
+                    "artist": f"ilike.%{artist}%",
+                    "title":  f"ilike.%{title}%",
+                    "limit":  1,
+                },
+                timeout=5,
+            )
+            rows = resp.json()
+            if isinstance(rows, list) and rows:
+                log(f"[SUPABASE] ✅ Cache hit (artist+title): {query}")
+                return rows[0]
 
         log(f"[SUPABASE] Miss: {query}")
         return None
+
     except Exception as exc:
         log(f"[SUPABASE] ❌ Lookup error: {exc}")
         return None
 
 
 def supabase_save(query: str, file_id: str, content_type: str):
-    """Save a newly uploaded song to Supabase."""
+    """Save a newly uploaded song to Supabase via REST."""
     try:
-        # Parse "artist - title" if possible
         parts = re.split(r'\s*-\s*', query.strip(), maxsplit=1)
         artist = parts[0].strip() if len(parts) == 2 else None
         title  = parts[1].strip() if len(parts) == 2 else query.strip()
@@ -108,8 +119,21 @@ def supabase_save(query: str, file_id: str, content_type: str):
             "file_id":      file_id,
             "content_type": content_type,
         }
-        supabase.table("songs").upsert(row, on_conflict="query").execute()
-        log(f"[SUPABASE] 💾 Saved: {query}")
+
+        # upsert — updates if query already exists, inserts if not
+        headers = {**SUPABASE_HEADERS, "Prefer": "resolution=merge-duplicates"}
+        resp = requests.post(
+            SUPABASE_TABLE,
+            headers=headers,
+            json=row,
+            timeout=10,
+        )
+
+        if resp.status_code in (200, 201, 204):
+            log(f"[SUPABASE] 💾 Saved: {query}")
+        else:
+            log(f"[SUPABASE] ❌ Save failed ({resp.status_code}): {resp.text}")
+
     except Exception as exc:
         log(f"[SUPABASE] ❌ Save error: {exc}")
 
@@ -117,10 +141,7 @@ def supabase_save(query: str, file_id: str, content_type: str):
 # ── Telegram helpers ──────────────────────────────────────────────────────
 
 def telegram_get_stream_url(file_id: str) -> str | None:
-    """
-    Exchange a Telegram file_id for a fresh CDN download URL.
-    Telegram file URLs expire, so always call this fresh.
-    """
+    """Exchange a Telegram file_id for a fresh CDN download URL."""
     try:
         resp = requests.get(
             f"{TELEGRAM_API}/getFile",
@@ -138,7 +159,7 @@ def telegram_get_stream_url(file_id: str) -> str | None:
         return None
 
 
-def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm") -> tuple[str | None, str | None]:
+def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"):
     """Upload a buffer to Telegram, return (file_id, error)."""
     file_buffer.seek(0)
     resp = requests.post(
@@ -154,7 +175,7 @@ def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"
 
 
 def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str, content_type: str):
-    """Upload completed buffer to Telegram, then save metadata to Supabase."""
+    """Upload completed buffer to Telegram, then save to Supabase."""
     try:
         size = buffer.tell()
         log(f"[TELEGRAM] ── Uploading '{query}' ({size:,} bytes) ──")
@@ -172,7 +193,6 @@ def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str, content_
                'mp3'  if 'mpeg' in content_type else 'webm')
         filename = f"{query.replace(' ', '_')}.{ext}"
 
-        buffer.seek(0)
         file_id, err = telegram_upload_buffer(buffer, filename=filename)
 
         if err:
@@ -243,7 +263,6 @@ def get_audio_stream(video_url: str):
 
 
 def resolve_youtube(query: str, cache_key: str):
-    """Resolve query → YouTube CDN (cdn_url, content_type)."""
     if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
         video_url = query
     else:
@@ -262,7 +281,7 @@ _SENTINEL = object()
 
 
 def _proxy(stream_url: str, content_type: str):
-    """Plain proxy — used for range/seek requests."""
+    """Plain proxy — used for Telegram-cached songs and range/seek requests."""
     upstream_headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
     if 'Range' in request.headers:
         upstream_headers['Range'] = request.headers['Range']
@@ -294,8 +313,8 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     """
     ONE CDN request:
       • streams chunks to client in real time
-      • buffers everything
-      • after full download, uploads to Telegram + saves to Supabase
+      • buffers everything into memory
+      • after full download completes, uploads to Telegram + saves to Supabase
     Queue is unbounded so puts never block and sentinel always gets through.
     """
     cache_key = query.lower()
@@ -369,7 +388,7 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
 
 @app.route('/')
 def home():
-    return "Usage: GET /audio?q=ARTIST+SONG  (e.g. ?q=Billie+Eilish+-+bury+a+friend)", 200
+    return "Usage: GET /audio?q=Artist+-+Song+Title", 200
 
 
 @app.route('/audio', methods=['GET', 'HEAD'])
@@ -385,15 +404,14 @@ def get_audio():
     if row:
         file_id      = row["file_id"]
         content_type = row.get("content_type", "audio/webm")
-        log(f"[AUDIO] Serving from Telegram cache: {query}")
+        log(f"[AUDIO] Serving from Telegram: {query}")
 
         stream_url = telegram_get_stream_url(file_id)
         if stream_url:
             return _proxy(stream_url, content_type)
-        else:
-            log(f"[AUDIO] Telegram URL fetch failed, falling back to YouTube: {query}")
+        log(f"[AUDIO] Telegram URL failed, falling back to YouTube: {query}")
 
-    # ── 2. Fall back to YouTube scrape ────────────────────────────────────
+    # ── 2. Fall back to YouTube ───────────────────────────────────────────
     log(f"[AUDIO] Scraping YouTube for: {query}")
     stream_url, ct = _cache_get(cache_key)
 
