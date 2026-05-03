@@ -2,6 +2,7 @@ import os
 import re
 import time
 import threading
+import queue
 import io
 import requests
 from flask import Flask, request, Response, stream_with_context
@@ -14,8 +15,8 @@ BOT_TOKEN = "8749662350:AAFaCiUaVcmc20hSLkEc3pGlf1p4NlG7wU8"
 CHAT_ID = "-1003992096916"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ── Upload tracking ─────────────────────────────────────────────────────────
-_uploading: set = set()  # Track which songs are currently uploading
+# ── Upload tracking ───────────────────────────────────────────────────────
+_uploading: set = set()
 _upload_lock = threading.Lock()
 
 # ── Server-side CDN URL cache ─────────────────────────────────────────────
@@ -120,139 +121,161 @@ def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"
     return None, result.get("description", "Unknown error")
 
 
-# ── Audio proxy + Telegram upload ─────────────────────────────────────────
-CHUNK = 8 * 1024
-
-def _proxy(stream_url: str, content_type: str):
-    """Just stream, no upload."""
-    upstream_headers = {
-        'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)',
-    }
-    if 'Range' in request.headers:
-        upstream_headers['Range'] = request.headers['Range']
-
-    yt = requests.get(stream_url, headers=upstream_headers,
-                      stream=True, timeout=(5, None))
-
-    resp_headers = {
-        'Content-Type':              content_type,
-        'Accept-Ranges':             'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control':             'no-store',
-    }
-    for h in ('Content-Length', 'Content-Range'):
-        if h in yt.headers:
-            resp_headers[h] = yt.headers[h]
-
-    def generate():
-        try:
-            for chunk in yt.iter_content(chunk_size=CHUNK):
-                if chunk:
-                    yield chunk
-        finally:
-            yt.close()
-
-    return Response(
-        stream_with_context(generate()),
-        status=yt.status_code,
-        headers=resp_headers,
-    )
-
-
-def _proxy_and_upload(stream_url: str, content_type: str, query: str):
-    """
-    Stream audio to client AND buffer it for Telegram upload.
-    Only uploads on full-file requests (no Range header).
-    Prevents duplicate uploads of the same song.
-    """
-    cache_key = query.lower()
-    
-    # Skip upload if this song is already being uploaded
-    with _upload_lock:
-        if cache_key in _uploading:
-            print(f"[TELEGRAM] Upload already in progress for: {query}")
-            return _proxy(stream_url, content_type)
-        _uploading.add(cache_key)
-    
-    # Only upload full files, not range/seek requests
-    is_range_request = 'Range' in request.headers
-    should_upload = not is_range_request
-    
-    if is_range_request:
-        print(f"[TELEGRAM] Skipping upload — this is a range/seek request: {query}")
-        with _upload_lock:
-            _uploading.discard(cache_key)
-        return _proxy(stream_url, content_type)
-
-    upstream_headers = {
-        'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)',
-    }
-
-    yt = requests.get(stream_url, headers=upstream_headers,
-                      stream=True, timeout=(5, None))
-
-    resp_headers = {
-        'Content-Type':              content_type,
-        'Accept-Ranges':             'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control':             'no-store',
-    }
-    for h in ('Content-Length', 'Content-Range'):
-        if h in yt.headers:
-            resp_headers[h] = yt.headers[h]
-
-    # Buffer for Telegram upload
-    buffer = io.BytesIO()
-
-    def generate():
-        try:
-            for chunk in yt.iter_content(chunk_size=CHUNK):
-                if chunk:
-                    buffer.write(chunk)
-                    yield chunk
-        finally:
-            yt.close()
-            # Upload in background after stream completes
-            if should_upload:
-                threading.Thread(
-                    target=_upload_to_telegram, 
-                    args=(buffer, query, cache_key), 
-                    daemon=True
-                ).start()
-            else:
-                buffer.close()
-                with _upload_lock:
-                    _uploading.discard(cache_key)
-
-    return Response(
-        stream_with_context(generate()),
-        status=yt.status_code,
-        headers=resp_headers,
-    )
-
-
-def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str):
-    """Upload buffered audio to Telegram after streaming completes."""
+def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str, content_type: str):
+    """Upload completed buffer to Telegram. Only called after full download."""
     try:
         size = buffer.tell()
-        print(f"\n[TELEGRAM] Starting upload for: {query} ({size:,} bytes)")
-        
+        print(f"[TELEGRAM] Uploading '{query}' — {size:,} bytes")
+
         if size < 1024:
-            print(f"[TELEGRAM] ❌ File too small ({size} bytes), skipping upload")
+            print(f"[TELEGRAM] ❌ Too small ({size} bytes), skipping")
             return
-        
-        file_id, err = telegram_upload_buffer(buffer, filename=f"{query.replace(' ', '_')}.webm")
+
+        ext = ('webm' if 'webm' in content_type else
+               'm4a'  if 'mp4'  in content_type else
+               'mp3'  if 'mpeg' in content_type else 'webm')
+        filename = f"{query.replace(' ', '_')}.{ext}"
+
+        file_id, err = telegram_upload_buffer(buffer, filename=filename)
         if err:
             print(f"[TELEGRAM] ❌ Upload failed: {err}")
         else:
-            print(f"[TELEGRAM] ✅ SUCCESS! file_id: {file_id}")
-            print(f"[TELEGRAM] 💾 Save this to Supabase: query='{query}', file_id='{file_id}'")
+            print(f"[TELEGRAM] ✅ Done! file_id={file_id}")
+            print(f"[TELEGRAM] 💾 Supabase → query='{query}', file_id='{file_id}'")
     except Exception as exc:
-        print(f"[TELEGRAM] ❌ Exception during upload: {exc}")
+        print(f"[TELEGRAM] ❌ Exception: {exc}")
     finally:
         buffer.close()
         with _upload_lock:
             _uploading.discard(cache_key)
+
+
+# ── Core: one download, stream to client + buffer for Telegram ───────────
+CHUNK = 8 * 1024
+
+# Bounded queue between downloader and Flask generator.
+# If client disconnects/pauses, queue fills up and downloader skips it
+# but keeps downloading. 64 × 8 KB = 512 KB max held in queue.
+QUEUE_MAX = 64
+
+_SENTINEL = object()  # signals "download done" to the generator
+
+
+def _proxy(stream_url: str, content_type: str):
+    """Plain proxy — used for range/seek requests only."""
+    upstream_headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
+    if 'Range' in request.headers:
+        upstream_headers['Range'] = request.headers['Range']
+
+    yt = requests.get(stream_url, headers=upstream_headers, stream=True, timeout=(5, None))
+
+    resp_headers = {
+        'Content-Type':               content_type,
+        'Accept-Ranges':              'bytes',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control':              'no-store',
+    }
+    for h in ('Content-Length', 'Content-Range'):
+        if h in yt.headers:
+            resp_headers[h] = yt.headers[h]
+
+    def generate():
+        try:
+            for chunk in yt.iter_content(chunk_size=CHUNK):
+                if chunk:
+                    yield chunk
+        finally:
+            yt.close()
+
+    return Response(stream_with_context(generate()), status=yt.status_code, headers=resp_headers)
+
+
+def _proxy_and_upload(stream_url: str, content_type: str, query: str):
+    """
+    ONE CDN request. Simultaneously:
+      • streams chunks to the client as they arrive  (no startup delay)
+      • writes every chunk into a BytesIO buffer
+      • after the full download completes, uploads the buffer to Telegram
+
+    Client disconnecting early has ZERO effect on the download or upload —
+    the downloader thread runs to completion regardless.
+    """
+    cache_key = query.lower()
+
+    # Range/seek → plain proxy, never try to upload a partial file
+    if 'Range' in request.headers:
+        print(f"[PROXY] Range request — plain proxy for: {query}")
+        return _proxy(stream_url, content_type)
+
+    # One upload at a time per song
+    with _upload_lock:
+        if cache_key in _uploading:
+            print(f"[PROXY] Upload already running for: {query}")
+            return _proxy(stream_url, content_type)
+        _uploading.add(cache_key)
+
+    chunk_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
+    buffer = io.BytesIO()
+
+    # ── Downloader thread ─────────────────────────────────────────────────
+    def downloader():
+        download_ok = False
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
+            resp = requests.get(stream_url, headers=headers,
+                                stream=True, timeout=(10, 120))
+            resp.raise_for_status()
+
+            for chunk in resp.iter_content(chunk_size=CHUNK):
+                if not chunk:
+                    continue
+                buffer.write(chunk)           # always write to buffer
+                try:
+                    chunk_queue.put_nowait(chunk)  # non-blocking: skip if client gone
+                except queue.Full:
+                    pass                      # client disconnected — keep downloading anyway
+
+            download_ok = True
+            print(f"[PROXY] ✅ Full download complete — {buffer.tell():,} bytes — '{query}'")
+
+        except Exception as exc:
+            print(f"[PROXY] ❌ Download error for '{query}': {exc}")
+        finally:
+            chunk_queue.put(_SENTINEL)        # always unblock the generator
+
+        if download_ok:
+            # Upload runs in this same background thread (already off main thread)
+            _upload_to_telegram(buffer, query, cache_key, content_type)
+        else:
+            buffer.close()
+            with _upload_lock:
+                _uploading.discard(cache_key)
+
+    threading.Thread(target=downloader, daemon=True).start()
+
+    # ── Response headers ──────────────────────────────────────────────────
+    resp_headers = {
+        'Content-Type':               content_type,
+        'Accept-Ranges':              'bytes',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control':              'no-store',
+        'X-Content-Type-Options':     'nosniff',
+    }
+
+    # ── Generator: drain queue → client ───────────────────────────────────
+    def generate():
+        while True:
+            try:
+                chunk = chunk_queue.get(timeout=60)
+            except queue.Empty:
+                # Downloader is taking too long or stalled — end client stream
+                print(f"[PROXY] Queue timeout for: {query}")
+                break
+            if chunk is _SENTINEL:
+                break
+            yield chunk
+
+    return Response(stream_with_context(generate()), status=200, headers=resp_headers)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -280,9 +303,7 @@ def get_audio():
             return "Error: no audio stream found", 404
 
     try:
-        resp = _proxy_and_upload(stream_url, ct or 'audio/webm', query)
-        return resp
-
+        return _proxy_and_upload(stream_url, ct or 'audio/webm', query)
     except requests.exceptions.RequestException as exc:
         return f"Error connecting to stream: {exc}", 502
 
