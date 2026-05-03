@@ -2,31 +2,35 @@ import os
 import re
 import time
 import threading
-from flask import Flask, request, Response, redirect
+import requests
+from flask import Flask, request, Response, stream_with_context
 import yt_dlp
 
 app = Flask(__name__)
 
-# ── Server-side URL cache ─────────────────────────────────────────────────
-# YouTube CDN URLs expire after ~6 hours. We cache for 4 hours to be safe.
-# On Android the 2-3s delay is yt-dlp processing time; with caching,
-# repeated plays of the same song are instant on both platforms.
+# ── Server-side CDN URL cache ─────────────────────────────────────────────
+# YouTube CDN URLs expire in ~6h. Cache for 4h so repeat plays skip yt-dlp.
 _cache: dict = {}
 _cache_lock = threading.Lock()
-CACHE_TTL = 4 * 3600  # 4 hours in seconds
+CACHE_TTL = 4 * 3600
 
 def _cache_get(key: str):
     with _cache_lock:
-        entry = _cache.get(key)
-        if entry and time.time() - entry['ts'] < CACHE_TTL:
-            return entry['url']
-    return None
+        e = _cache.get(key)
+        if e and time.time() - e['ts'] < CACHE_TTL:
+            return e['url'], e.get('ct', 'audio/webm')
+    return None, None
 
-def _cache_set(key: str, url: str):
+def _cache_set(key: str, url: str, ct: str = 'audio/webm'):
     with _cache_lock:
-        _cache[key] = {'url': url, 'ts': time.time()}
+        _cache[key] = {'url': url, 'ts': time.time(), 'ct': ct}
 
-# ── YouTube Music / yt-dlp helpers ────────────────────────────────────────
+def _cache_del(key: str):
+    with _cache_lock:
+        _cache.pop(key, None)
+
+
+# ── yt-dlp helpers ────────────────────────────────────────────────────────
 YTMUSIC_AVAILABLE = False
 try:
     from ytmusicapi import YTMusic
@@ -36,132 +40,159 @@ except ImportError:
     ytm = None
 
 
-def search_youtube_music(query):
-    """Search YouTube Music for a query and return the top result video URL."""
+def search_youtube_music(query: str):
+    """Return the best-match YouTube URL for a search query."""
     if YTMUSIC_AVAILABLE:
-        results = ytm.search(query, filter="songs", limit=1)
-        if not results:
-            results = ytm.search(query, limit=1)
+        results = ytm.search(query, filter="songs", limit=1) or ytm.search(query, limit=1)
         if results:
-            video_id = results[0].get("videoId")
-            if video_id:
-                return f"https://music.youtube.com/watch?v={video_id}"
+            vid = results[0].get("videoId")
+            if vid:
+                return f"https://music.youtube.com/watch?v={vid}"
         return None
-    else:
-        # Fallback: use ytsearch with web_music client for music-biased results
-        search_query = f"ytsearch1:{query}"
-        ydl_opts = {
-            'quiet': True,
-            'skip_download': True,
-            'extract_flat': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['web_music'],
-                },
-            },
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_query, download=False)
-            entries = info.get('entries', [])
-            if not entries:
-                return None
-            return entries[0]['url']
-
-
-def get_audio_stream_url(video_url):
-    """Extract the best audio-only stream URL from a YouTube video.
-
-    Prefers opus/m4a audio-only formats. Falls back to any audio-bearing
-    format. Returns None if nothing is found.
-    """
-    ydl_opts = {
-        # Prefer audio-only; opus at 160 kbps is YouTube's best audio-only
-        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-        'quiet': True,
-        'skip_download': True,
-        'extract_flat': False,
+    # Fallback: plain yt-dlp search
+    opts = {
+        'quiet': True, 'skip_download': True, 'extract_flat': True,
+        'extractor_args': {'youtube': {'player_client': ['web_music']}},
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+        entries = info.get('entries', [])
+        return entries[0]['url'] if entries else None
+
+
+_MIME = {'webm': 'audio/webm', 'm4a': 'audio/mp4',
+         'mp4': 'audio/mp4', 'ogg': 'audio/ogg', 'mp3': 'audio/mpeg'}
+
+def get_audio_stream(video_url: str):
+    """Run yt-dlp and return (cdn_url, content_type)."""
+    opts = {
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+        'quiet': True, 'skip_download': True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
-        formats = info.get('formats', [])
-
-        # Audio-only streams first (no video track)
-        audio_formats = [
-            f for f in formats
-            if f.get('acodec') != 'none' and f.get('vcodec') == 'none'
-        ]
-        if not audio_formats:
-            audio_formats = [f for f in formats if f.get('acodec') != 'none']
-        if not audio_formats:
+        fmts = info.get('formats', [])
+        audio = [f for f in fmts if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+        if not audio:
+            audio = [f for f in fmts if f.get('acodec') != 'none']
+        if not audio:
             return None, None
-
-        audio_formats.sort(
-            key=lambda x: x.get('abr', 0) or x.get('tbr', 0) or 0,
-            reverse=True,
-        )
-        best = audio_formats[0]
-        # Return URL and content-type so we can pass it through if needed
-        mime = best.get('ext', 'webm')
-        mime_map = {'webm': 'audio/webm', 'm4a': 'audio/mp4',
-                    'mp4': 'audio/mp4', 'ogg': 'audio/ogg', 'mp3': 'audio/mpeg'}
-        content_type = mime_map.get(mime, 'audio/webm')
-        return best['url'], content_type
+        audio.sort(key=lambda x: x.get('abr') or x.get('tbr') or 0, reverse=True)
+        best = audio[0]
+        ct = _MIME.get(best.get('ext', ''), 'audio/webm')
+        return best['url'], ct
 
 
-# ── Routes ────────────────────────────────────────────────────────────────
+def resolve(query: str, cache_key: str):
+    """Resolve query → (cdn_url, content_type). Populates cache."""
+    if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
+        video_url = query
+    else:
+        video_url = search_youtube_music(query)
+        if not video_url:
+            return None, None
+    url, ct = get_audio_stream(video_url)
+    if url:
+        _cache_set(cache_key, url, ct)
+    return url, ct
+
+
+# ── Audio proxy ───────────────────────────────────────────────────────────
+# Chunk size: 8 KB ≈ 0.5 s of 128 kbps audio.
+# Small chunks mean the browser receives the first bytes quickly and can
+# start decoding/playing before the rest of the song arrives.
+CHUNK = 8 * 1024
+
+def _proxy(stream_url: str, content_type: str):
+    """
+    Open a streaming connection to YouTube CDN, forward Range headers from
+    the client, and pipe bytes back in small chunks so playback starts ASAP.
+
+    iOS Safari requires:
+      • Accept-Ranges: bytes           (so it can seek)
+      • Content-Range / Content-Length (so it knows file size)
+      • A real audio/* Content-Type    (not text/plain)
+    All three are satisfied here.
+    """
+    # Forward the client's Range header so iOS can seek and so the CDN
+    # returns a 206 Partial Content response immediately.
+    upstream_headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)',
+    }
+    if 'Range' in request.headers:
+        upstream_headers['Range'] = request.headers['Range']
+
+    yt = requests.get(stream_url, headers=upstream_headers,
+                      stream=True, timeout=(5, None))
+
+    resp_headers = {
+        'Content-Type':              content_type,
+        'Accept-Ranges':             'bytes',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control':             'no-store',
+    }
+    # Pass through size/range headers so iOS knows how big the file is
+    for h in ('Content-Length', 'Content-Range'):
+        if h in yt.headers:
+            resp_headers[h] = yt.headers[h]
+
+    def generate():
+        try:
+            for chunk in yt.iter_content(chunk_size=CHUNK):
+                if chunk:
+                    yield chunk
+        finally:
+            yt.close()
+
+    return Response(
+        stream_with_context(generate()),
+        status=yt.status_code,   # 200 or 206 Partial Content
+        headers=resp_headers,
+    )
+
+
 @app.route('/')
 def home():
-    return "Usage: GET /audio?q=SONG+NAME+AND+ARTIST", 200
+    return "Usage: GET /audio?q=ARTIST+SONG", 200
 
 
 @app.route('/audio', methods=['GET', 'HEAD'])
 def get_audio():
-    query = request.args.get('q')
+    query = request.args.get('q', '').strip()
     if not query:
-        return "Error: Missing q parameter", 400
+        return "Error: missing q parameter", 400
 
-    # Normalise cache key — strip the JS cache-buster (_cb param) if present
-    cache_key = query.strip().lower()
+    cache_key = query.lower()
 
-    # ── Cache hit: instant response ───────────────────────────────────────
-    cached_url = _cache_get(cache_key)
-    if cached_url:
-        # 302 redirect → browser loads directly from YouTube CDN.
-        # This gives iOS Safari the proper Content-Type, Accept-Ranges, and
-        # Content-Length headers it needs to start buffering immediately.
-        resp = redirect(cached_url, 302)
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        resp.headers['Cache-Control'] = 'no-store'
-        return resp
+    # ── Fast path: CDN URL already cached ────────────────────────────────
+    stream_url, ct = _cache_get(cache_key)
 
-    # ── Cache miss: resolve via yt-dlp ───────────────────────────────────
-    try:
-        if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
-            video_url = query
-        else:
-            video_url = search_youtube_music(query)
-            if not video_url:
-                return "Error: No search results found", 404
-
-        stream_url, _ = get_audio_stream_url(video_url)
+    # ── Slow path: run yt-dlp to find the CDN URL ─────────────────────────
+    if not stream_url:
+        try:
+            stream_url, ct = resolve(query, cache_key)
+        except Exception as exc:
+            return f"Error resolving stream: {exc}", 500
         if not stream_url:
-            return "Error: No audio stream found", 404
+            return "Error: no audio stream found", 404
 
-        # Store in cache for subsequent plays
-        _cache_set(cache_key, stream_url)
+    # ── Proxy the audio, retrying once if the cached URL has expired ──────
+    try:
+        resp = _proxy(stream_url, ct or 'audio/webm')
 
-        # 302 redirect so the browser talks directly to YouTube CDN.
-        # iOS Safari REQUIRES Accept-Ranges + Content-Length (which YouTube
-        # CDN provides) to start playback without a 25-30 second stall.
-        # Returning text/plain (the old behaviour) makes iOS retry dozens of
-        # times before giving up — hence the 30-second delay.
-        resp = redirect(stream_url, 302)
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        resp.headers['Cache-Control'] = 'no-store'
+        # YouTube returns 403/410 when a CDN URL has expired.
+        # Clear cache, re-resolve, and retry once.
+        if resp.status_code in (403, 410):
+            _cache_del(cache_key)
+            stream_url, ct = resolve(query, cache_key)
+            if not stream_url:
+                return "Error: stream expired and could not be refreshed", 503
+            resp = _proxy(stream_url, ct or 'audio/webm')
+
         return resp
 
-    except Exception as e:
-        return f"Error: {str(e)}", 500
+    except requests.exceptions.RequestException as exc:
+        return f"Error connecting to stream: {exc}", 502
 
 
 if __name__ == '__main__':
