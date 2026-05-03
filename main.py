@@ -10,10 +10,13 @@ import yt_dlp
 app = Flask(__name__)
 
 # ── Telegram config ───────────────────────────────────────────────────────
-# TODO: Replace CHAT_ID after running /test-chat-id once
 BOT_TOKEN = "8749662350:AAFaCiUaVcmc20hSLkEc3pGlf1p4NlG7wU8"
-CHAT_ID = "-1003992096916"  # <-- REPLACE THIS (e.g. -1001234567890)
+CHAT_ID = "-1003992096916"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# ── Upload tracking ─────────────────────────────────────────────────────────
+_uploading: set = set()  # Track which songs are currently uploading
+_upload_lock = threading.Lock()
 
 # ── Server-side CDN URL cache ─────────────────────────────────────────────
 _cache: dict = {}
@@ -55,7 +58,6 @@ def search_youtube_music(query: str):
             if vid:
                 return f"https://music.youtube.com/watch?v={vid}"
         return None
-    # Fallback: plain yt-dlp search
     opts = {
         'quiet': True, 'skip_download': True, 'extract_flat': True,
         'extractor_args': {'youtube': {'player_client': ['web_music']}},
@@ -105,22 +107,6 @@ def resolve(query: str, cache_key: str):
 
 # ── Telegram helpers ──────────────────────────────────────────────────────
 
-def telegram_get_chat_id():
-    """Find channel/chat ID from recent updates."""
-    resp = requests.get(f"{TELEGRAM_API}/getUpdates")
-    data = resp.json()
-    if not data.get("result"):
-        return None, "No updates found. Send a message in your channel first."
-    for update in data["result"]:
-        if "channel_post" in update:
-            chat = update["channel_post"]["chat"]
-            return chat["id"], f"Channel: {chat['title']} | ID: {chat['id']}"
-        elif "message" in update:
-            chat = update["message"]["chat"]
-            return chat["id"], f"Chat: {chat.get('title', chat.get('first_name'))} | ID: {chat['id']}"
-    return None, "No channel/chat found in updates."
-
-
 def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"):
     """Upload a file buffer to Telegram and return file_id."""
     file_buffer.seek(0)
@@ -137,16 +123,70 @@ def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"
 # ── Audio proxy + Telegram upload ─────────────────────────────────────────
 CHUNK = 8 * 1024
 
-def _proxy_and_upload(stream_url: str, content_type: str, query: str):
-    """
-    Stream audio to client AND buffer it for Telegram upload.
-    Uses a background thread so upload doesn't block streaming.
-    """
+def _proxy(stream_url: str, content_type: str):
+    """Just stream, no upload."""
     upstream_headers = {
         'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)',
     }
     if 'Range' in request.headers:
         upstream_headers['Range'] = request.headers['Range']
+
+    yt = requests.get(stream_url, headers=upstream_headers,
+                      stream=True, timeout=(5, None))
+
+    resp_headers = {
+        'Content-Type':              content_type,
+        'Accept-Ranges':             'bytes',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control':             'no-store',
+    }
+    for h in ('Content-Length', 'Content-Range'):
+        if h in yt.headers:
+            resp_headers[h] = yt.headers[h]
+
+    def generate():
+        try:
+            for chunk in yt.iter_content(chunk_size=CHUNK):
+                if chunk:
+                    yield chunk
+        finally:
+            yt.close()
+
+    return Response(
+        stream_with_context(generate()),
+        status=yt.status_code,
+        headers=resp_headers,
+    )
+
+
+def _proxy_and_upload(stream_url: str, content_type: str, query: str):
+    """
+    Stream audio to client AND buffer it for Telegram upload.
+    Only uploads on full-file requests (no Range header).
+    Prevents duplicate uploads of the same song.
+    """
+    cache_key = query.lower()
+    
+    # Skip upload if this song is already being uploaded
+    with _upload_lock:
+        if cache_key in _uploading:
+            print(f"[TELEGRAM] Upload already in progress for: {query}")
+            return _proxy(stream_url, content_type)
+        _uploading.add(cache_key)
+    
+    # Only upload full files, not range/seek requests
+    is_range_request = 'Range' in request.headers
+    should_upload = not is_range_request
+    
+    if is_range_request:
+        print(f"[TELEGRAM] Skipping upload — this is a range/seek request: {query}")
+        with _upload_lock:
+            _uploading.discard(cache_key)
+        return _proxy(stream_url, content_type)
+
+    upstream_headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)',
+    }
 
     yt = requests.get(stream_url, headers=upstream_headers,
                       stream=True, timeout=(5, None))
@@ -172,8 +212,17 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
                     yield chunk
         finally:
             yt.close()
-            # After stream finishes, upload to Telegram in background
-            threading.Thread(target=_upload_to_telegram, args=(buffer, query), daemon=True).start()
+            # Upload in background after stream completes
+            if should_upload:
+                threading.Thread(
+                    target=_upload_to_telegram, 
+                    args=(buffer, query, cache_key), 
+                    daemon=True
+                ).start()
+            else:
+                buffer.close()
+                with _upload_lock:
+                    _uploading.discard(cache_key)
 
     return Response(
         stream_with_context(generate()),
@@ -182,10 +231,16 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     )
 
 
-def _upload_to_telegram(buffer: io.BytesIO, query: str):
+def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str):
     """Upload buffered audio to Telegram after streaming completes."""
     try:
-        print(f"\n[TELEGRAM] Starting upload for: {query}")
+        size = buffer.tell()
+        print(f"\n[TELEGRAM] Starting upload for: {query} ({size:,} bytes)")
+        
+        if size < 1024:
+            print(f"[TELEGRAM] ❌ File too small ({size} bytes), skipping upload")
+            return
+        
         file_id, err = telegram_upload_buffer(buffer, filename=f"{query.replace(' ', '_')}.webm")
         if err:
             print(f"[TELEGRAM] ❌ Upload failed: {err}")
@@ -196,6 +251,8 @@ def _upload_to_telegram(buffer: io.BytesIO, query: str):
         print(f"[TELEGRAM] ❌ Exception during upload: {exc}")
     finally:
         buffer.close()
+        with _upload_lock:
+            _uploading.discard(cache_key)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -203,19 +260,6 @@ def _upload_to_telegram(buffer: io.BytesIO, query: str):
 @app.route('/')
 def home():
     return "Usage: GET /audio?q=ARTIST+SONG", 200
-
-
-@app.route('/test-chat-id')
-def test_chat_id():
-    """Run this first to find your channel ID."""
-    chat_id, info = telegram_get_chat_id()
-    if chat_id:
-        return {
-            "chat_id": chat_id,
-            "info": info,
-            "instruction": f"Copy this into CHAT_ID at the top of main.py: {chat_id}"
-        }, 200
-    return {"error": info}, 400
 
 
 @app.route('/audio', methods=['GET', 'HEAD'])
@@ -236,7 +280,6 @@ def get_audio():
             return "Error: no audio stream found", 404
 
     try:
-        # NEW: Stream to client AND upload to Telegram simultaneously
         resp = _proxy_and_upload(stream_url, ct or 'audio/webm', query)
         return resp
 
