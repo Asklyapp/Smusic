@@ -12,7 +12,7 @@ app = Flask(__name__)
 # ── Telegram config ───────────────────────────────────────────────────────
 # TODO: Replace CHAT_ID after running /test-chat-id once
 BOT_TOKEN = "8749662350:AAFaCiUaVcmc20hSLkEc3pGlf1p4NlG7wU8"
-CHAT_ID = "1003992096916"  # <-- REPLACE THIS (e.g. -1001234567890)
+CHAT_ID = "-1003992096916"  # <-- REPLACE THIS (e.g. -1001234567890)
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ── Server-side CDN URL cache ─────────────────────────────────────────────
