@@ -2,14 +2,20 @@ import os
 import re
 import time
 import threading
+import io
 import requests
 from flask import Flask, request, Response, stream_with_context
 import yt_dlp
 
 app = Flask(__name__)
 
+# ── Telegram config ───────────────────────────────────────────────────────
+# TODO: Replace CHAT_ID after running /test-chat-id once
+BOT_TOKEN = "8749662350:AAFaCiUaVcmc20hSLkEc3pGlf1p4NlG7wU8"
+CHAT_ID = "-100XXXXXXXXXX"  # <-- REPLACE THIS (e.g. -1001234567890)
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 # ── Server-side CDN URL cache ─────────────────────────────────────────────
-# YouTube CDN URLs expire in ~6h. Cache for 4h so repeat plays skip yt-dlp.
 _cache: dict = {}
 _cache_lock = threading.Lock()
 CACHE_TTL = 4 * 3600
@@ -97,25 +103,45 @@ def resolve(query: str, cache_key: str):
     return url, ct
 
 
-# ── Audio proxy ───────────────────────────────────────────────────────────
-# Chunk size: 8 KB ≈ 0.5 s of 128 kbps audio.
-# Small chunks mean the browser receives the first bytes quickly and can
-# start decoding/playing before the rest of the song arrives.
+# ── Telegram helpers ──────────────────────────────────────────────────────
+
+def telegram_get_chat_id():
+    """Find channel/chat ID from recent updates."""
+    resp = requests.get(f"{TELEGRAM_API}/getUpdates")
+    data = resp.json()
+    if not data.get("result"):
+        return None, "No updates found. Send a message in your channel first."
+    for update in data["result"]:
+        if "channel_post" in update:
+            chat = update["channel_post"]["chat"]
+            return chat["id"], f"Channel: {chat['title']} | ID: {chat['id']}"
+        elif "message" in update:
+            chat = update["message"]["chat"]
+            return chat["id"], f"Chat: {chat.get('title', chat.get('first_name'))} | ID: {chat['id']}"
+    return None, "No channel/chat found in updates."
+
+
+def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"):
+    """Upload a file buffer to Telegram and return file_id."""
+    file_buffer.seek(0)
+    url = f"{TELEGRAM_API}/sendDocument"
+    files = {"document": (filename, file_buffer)}
+    data = {"chat_id": CHAT_ID}
+    resp = requests.post(url, data=data, files=files)
+    result = resp.json()
+    if result.get("ok"):
+        return result["result"]["document"]["file_id"], None
+    return None, result.get("description", "Unknown error")
+
+
+# ── Audio proxy + Telegram upload ─────────────────────────────────────────
 CHUNK = 8 * 1024
 
-def _proxy(stream_url: str, content_type: str):
+def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     """
-    Open a streaming connection to YouTube CDN, forward Range headers from
-    the client, and pipe bytes back in small chunks so playback starts ASAP.
-
-    iOS Safari requires:
-      • Accept-Ranges: bytes           (so it can seek)
-      • Content-Range / Content-Length (so it knows file size)
-      • A real audio/* Content-Type    (not text/plain)
-    All three are satisfied here.
+    Stream audio to client AND buffer it for Telegram upload.
+    Uses a background thread so upload doesn't block streaming.
     """
-    # Forward the client's Range header so iOS can seek and so the CDN
-    # returns a 206 Partial Content response immediately.
     upstream_headers = {
         'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)',
     }
@@ -131,29 +157,65 @@ def _proxy(stream_url: str, content_type: str):
         'Access-Control-Allow-Origin': '*',
         'Cache-Control':             'no-store',
     }
-    # Pass through size/range headers so iOS knows how big the file is
     for h in ('Content-Length', 'Content-Range'):
         if h in yt.headers:
             resp_headers[h] = yt.headers[h]
+
+    # Buffer for Telegram upload
+    buffer = io.BytesIO()
 
     def generate():
         try:
             for chunk in yt.iter_content(chunk_size=CHUNK):
                 if chunk:
+                    buffer.write(chunk)
                     yield chunk
         finally:
             yt.close()
+            # After stream finishes, upload to Telegram in background
+            threading.Thread(target=_upload_to_telegram, args=(buffer, query), daemon=True).start()
 
     return Response(
         stream_with_context(generate()),
-        status=yt.status_code,   # 200 or 206 Partial Content
+        status=yt.status_code,
         headers=resp_headers,
     )
 
 
+def _upload_to_telegram(buffer: io.BytesIO, query: str):
+    """Upload buffered audio to Telegram after streaming completes."""
+    try:
+        print(f"\n[TELEGRAM] Starting upload for: {query}")
+        file_id, err = telegram_upload_buffer(buffer, filename=f"{query.replace(' ', '_')}.webm")
+        if err:
+            print(f"[TELEGRAM] ❌ Upload failed: {err}")
+        else:
+            print(f"[TELEGRAM] ✅ SUCCESS! file_id: {file_id}")
+            print(f"[TELEGRAM] 💾 Save this to Supabase: query='{query}', file_id='{file_id}'")
+    except Exception as exc:
+        print(f"[TELEGRAM] ❌ Exception during upload: {exc}")
+    finally:
+        buffer.close()
+
+
+# ── Routes ────────────────────────────────────────────────────────────────
+
 @app.route('/')
 def home():
     return "Usage: GET /audio?q=ARTIST+SONG", 200
+
+
+@app.route('/test-chat-id')
+def test_chat_id():
+    """Run this first to find your channel ID."""
+    chat_id, info = telegram_get_chat_id()
+    if chat_id:
+        return {
+            "chat_id": chat_id,
+            "info": info,
+            "instruction": f"Copy this into CHAT_ID at the top of main.py: {chat_id}"
+        }, 200
+    return {"error": info}, 400
 
 
 @app.route('/audio', methods=['GET', 'HEAD'])
@@ -163,11 +225,8 @@ def get_audio():
         return "Error: missing q parameter", 400
 
     cache_key = query.lower()
-
-    # ── Fast path: CDN URL already cached ────────────────────────────────
     stream_url, ct = _cache_get(cache_key)
 
-    # ── Slow path: run yt-dlp to find the CDN URL ─────────────────────────
     if not stream_url:
         try:
             stream_url, ct = resolve(query, cache_key)
@@ -176,19 +235,9 @@ def get_audio():
         if not stream_url:
             return "Error: no audio stream found", 404
 
-    # ── Proxy the audio, retrying once if the cached URL has expired ──────
     try:
-        resp = _proxy(stream_url, ct or 'audio/webm')
-
-        # YouTube returns 403/410 when a CDN URL has expired.
-        # Clear cache, re-resolve, and retry once.
-        if resp.status_code in (403, 410):
-            _cache_del(cache_key)
-            stream_url, ct = resolve(query, cache_key)
-            if not stream_url:
-                return "Error: stream expired and could not be refreshed", 503
-            resp = _proxy(stream_url, ct or 'audio/webm')
-
+        # NEW: Stream to client AND upload to Telegram simultaneously
+        resp = _proxy_and_upload(stream_url, ct or 'audio/webm', query)
         return resp
 
     except requests.exceptions.RequestException as exc:
