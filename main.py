@@ -32,10 +32,14 @@ TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 _uploading: set = set()
 _upload_lock = threading.Lock()
 
-# ── In-memory CDN URL cache ───────────────────────────────────────────────
-_cache: dict = {}
+# ── In-memory caches ──────────────────────────────────────────────────────
+_cache: dict = {}           # YouTube stream URL cache
 _cache_lock = threading.Lock()
-CACHE_TTL = 4 * 3600
+CACHE_TTL = 10 * 60         # 10 minutes for stream URLs
+
+_telegram_cache: dict = {}  # Telegram CDN URL cache (separate, longer TTL)
+_telegram_cache_lock = threading.Lock()
+TELEGRAM_CACHE_TTL = 4 * 3600  # 4 hours
 
 def _cache_get(key: str):
     with _cache_lock:
@@ -47,6 +51,17 @@ def _cache_get(key: str):
 def _cache_set(key: str, url: str, ct: str = 'audio/webm'):
     with _cache_lock:
         _cache[key] = {'url': url, 'ts': time.time(), 'ct': ct}
+
+def _telegram_cache_get(key: str):
+    with _telegram_cache_lock:
+        e = _telegram_cache.get(key)
+        if e and time.time() - e['ts'] < TELEGRAM_CACHE_TTL:
+            return e['url']
+    return None
+
+def _telegram_cache_set(key: str, url: str):
+    with _telegram_cache_lock:
+        _telegram_cache[key] = {'url': url, 'ts': time.time()}
 
 
 # ── Logging ───────────────────────────────────────────────────────────────
@@ -296,31 +311,28 @@ def _proxy(stream_url: str, content_type: str):
 
 def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     """
-    ONE YouTube CDN request:
-      • streams chunks to client in real time
-      • buffers everything into memory
-      • after full download, uploads to Telegram + saves file_id to Supabase
-    Queue is unbounded so puts never block and sentinel always gets through.
+    Streams to client AND uploads to Telegram in background.
+    Handles both Range and non-Range requests.
     """
     cache_key = query.lower()
 
-    if 'Range' in request.headers:
-        log(f"[PROXY] Range request — plain proxy: {query}")
-        return _proxy(stream_url, content_type)
-
+    # Check if already uploading
     with _upload_lock:
         if cache_key in _uploading:
             log(f"[PROXY] Already uploading: {query}")
             return _proxy(stream_url, content_type)
         _uploading.add(cache_key)
 
-    chunk_queue: queue.Queue = queue.Queue()  # unbounded — puts never block
+    chunk_queue: queue.Queue = queue.Queue()
     buffer = io.BytesIO()
 
     def downloader():
         download_ok = False
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
+            if 'Range' in request.headers:
+                headers['Range'] = request.headers['Range']
+
             resp = requests.get(stream_url, headers=headers,
                                 stream=True, timeout=(10, 120))
             resp.raise_for_status()
@@ -329,7 +341,7 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
                 if not chunk:
                     continue
                 buffer.write(chunk)
-                chunk_queue.put(chunk)   # never blocks
+                chunk_queue.put(chunk)
 
             download_ok = True
             log(f"[PROXY] ✅ Full download complete — {buffer.tell():,} bytes — '{query}'")
@@ -384,25 +396,33 @@ def get_audio():
 
     cache_key = query.lower()
 
-    # ── 1. Supabase check — serve straight from Telegram if we have it ────
+    # ── 1. Check in-memory Telegram cache first (fastest) ─────────────────
+    telegram_url = _telegram_cache_get(cache_key)
+    if telegram_url:
+        log(f"[AUDIO] In-memory Telegram cache hit: {query}")
+        return redirect(telegram_url, code=302)
+
+    # ── 2. Check Supabase ─────────────────────────────────────────────────
     row = supabase_lookup(query)
     if row:
         file_id = row["file_id"]
-        log(f"[AUDIO] Cache hit — fetching Telegram URL for: {query}")
+        log(f"[AUDIO] Supabase cache hit — fetching Telegram URL for: {query}")
 
         stream_url = telegram_get_stream_url(file_id)
         if stream_url:
-            # 302 redirect — app streams directly from Telegram, server does nothing
+            _telegram_cache_set(cache_key, stream_url)
             log(f"[AUDIO] Redirecting to Telegram CDN for: {query}")
             return redirect(stream_url, code=302)
 
         log(f"[AUDIO] Telegram URL fetch failed, falling back to YouTube: {query}")
 
-    # ── 2. Not cached — scrape YouTube, stream to client, upload to Telegram
-    log(f"[AUDIO] Scraping YouTube for: {query}")
+    # ── 3. Check in-memory YouTube stream cache ───────────────────────────
     stream_url, ct = _cache_get(cache_key)
-
-    if not stream_url:
+    if stream_url:
+        log(f"[AUDIO] In-memory YouTube stream cache hit: {query}")
+    else:
+        # ── 4. Not cached — scrape YouTube ────────────────────────────────
+        log(f"[AUDIO] Scraping YouTube for: {query}")
         try:
             stream_url, ct = resolve_youtube(query, cache_key)
         except Exception as exc:
@@ -410,6 +430,7 @@ def get_audio():
         if not stream_url:
             return "Error: no audio stream found", 404
 
+    # ── 5. Stream to client AND upload in background ──────────────────────
     try:
         return _proxy_and_upload(stream_url, ct or 'audio/webm', query)
     except requests.exceptions.RequestException as exc:
