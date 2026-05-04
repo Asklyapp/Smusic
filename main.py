@@ -154,8 +154,7 @@ def search_youtube(query: str) -> str | None:
                 return f"https://music.youtube.com/watch?v={vid}"
         return None
     opts = {'quiet': True, 'skip_download': True, 'extract_flat': True,
-            'extractor_args': {'youtube': {'player_client': ['web_music']}},
-            'js_runtimes': ['node:/data/data/com.termux/files/usr/bin/node']}
+            'extractor_args': {'youtube': {'player_client': ['web_music']}}}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch1:{query}", download=False)
         entries = info.get('entries', [])
@@ -167,8 +166,7 @@ _MIME = {'webm': 'audio/webm', 'm4a': 'audio/mp4',
 
 def get_cdn_url(video_url: str) -> tuple[str | None, str]:
     opts = {'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-            'quiet': True, 'skip_download': True,
-            'js_runtimes': ['node:/data/data/com.termux/files/usr/bin/node']}
+            'quiet': True, 'skip_download': True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         fmts = info.get('formats', [])
