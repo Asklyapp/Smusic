@@ -312,7 +312,7 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     cache_key = query.lower()
 
     # Range/seek — pass straight through with the Range header intact
-    if 'Range' in request.headers:
+    if 'Range' in request.headers and stream_url:
         log(f"[PROXY] Range request — plain proxy: {query}")
         return _proxy(stream_url, content_type)
 
@@ -443,25 +443,22 @@ def get_audio():
             return redirect(tg_url, code=302)
         log(f"[AUDIO] Telegram URL failed, falling back to YouTube")
 
-    # ── 2. Already downloading? _proxy_and_upload handles tap-in ─────────
+    # ── 2. Already downloading? Tap in — no YouTube scrape needed ────────
     with _active_lock:
-        already_active = cache_key in _active
+        if cache_key in _active:
+            log(f"[AUDIO] Tapping into active download: {query}")
+            return _proxy_and_upload(None, _active[cache_key]['ct'], query)
 
-    # ── 3. Resolve YouTube CDN URL (only if not already active) ──────────
-    if not already_active:
-        log(f"[AUDIO] Scraping YouTube for: {query}")
-        stream_url, ct = _cache_get(cache_key)
+    # ── 3. Scrape YouTube — only runs if not in Supabase or active ────────
+    log(f"[AUDIO] Scraping YouTube for: {query}")
+    stream_url, ct = _cache_get(cache_key)
+    if not stream_url:
+        try:
+            stream_url, ct = resolve_youtube(query, cache_key)
+        except Exception as exc:
+            return f"Error resolving stream: {exc}", 500
         if not stream_url:
-            try:
-                stream_url, ct = resolve_youtube(query, cache_key)
-            except Exception as exc:
-                return f"Error resolving stream: {exc}", 500
-            if not stream_url:
-                return "Error: no audio stream found", 404
-    else:
-        log(f"[AUDIO] Tapping into active download: {query}")
-        stream_url = "active"   # _proxy_and_upload will detect _active entry
-        ct = _active[cache_key]['ct']
+            return "Error: no audio stream found", 404
 
     try:
         return _proxy_and_upload(stream_url, ct or 'audio/webm', query)
