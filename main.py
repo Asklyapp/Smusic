@@ -2,7 +2,6 @@ import os
 import re
 import time
 import threading
-import queue
 import io
 import requests
 from flask import Flask, request, Response, stream_with_context, redirect
@@ -10,7 +9,7 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# ── Supabase REST config ──────────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────────────
 SUPABASE_URL = "https://bzlbyagjpblzgeiixyud.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ6bGJ5YWdqcGJsemdlaWl4eXVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzMDEwMTYsImV4cCI6MjA4ODg3NzAxNn0.HJp0_O2jf286nFwaQwecn0M1OIuNu9TDz_S3RBwXDZM"
 SUPABASE_HEADERS = {
@@ -21,62 +20,37 @@ SUPABASE_HEADERS = {
 }
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/songs"
 
-# ── Telegram config ───────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────
 BOT_TOKEN    = "8749662350:AAFaCiUaVcmc20hSLkEc3pGlf1p4NlG7wU8"
 CHAT_ID      = "-1003992096916"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_MAX_BYTES = 50 * 1024 * 1024
 
-TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+# ── Active streams ────────────────────────────────────────────────────────
+# When a song is currently being downloaded, we keep it here so any other
+# listener who wants the same song gets the already-downloaded bytes
+# immediately plus the rest as it arrives — no second YouTube call.
+#
+# Structure per key:
+#   {
+#     'buffer': BytesIO,          # all bytes downloaded so far
+#     'done':   bool,             # True once download is complete
+#     'lock':   threading.Lock,   # protects buffer reads
+#     'waiters': list[Event],     # one Event per extra listener
+#   }
+_active: dict = {}
+_active_lock = threading.Lock()
 
-# ── Upload tracking ───────────────────────────────────────────────────────
-_uploading: set = set()
-_upload_lock = threading.Lock()
-
-# ── In-memory caches ──────────────────────────────────────────────────────
-_cache: dict = {}           # YouTube stream URL cache
-_cache_lock = threading.Lock()
-CACHE_TTL = 10 * 60         # 10 minutes for stream URLs
-
-_telegram_cache: dict = {}  # Telegram CDN URL cache (separate, longer TTL)
-_telegram_cache_lock = threading.Lock()
-TELEGRAM_CACHE_TTL = 4 * 3600  # 4 hours
-
-def _cache_get(key: str):
-    with _cache_lock:
-        e = _cache.get(key)
-        if e and time.time() - e['ts'] < CACHE_TTL:
-            return e['url'], e.get('ct', 'audio/webm')
-    return None, None
-
-def _cache_set(key: str, url: str, ct: str = 'audio/webm'):
-    with _cache_lock:
-        _cache[key] = {'url': url, 'ts': time.time(), 'ct': ct}
-
-def _telegram_cache_get(key: str):
-    with _telegram_cache_lock:
-        e = _telegram_cache.get(key)
-        if e and time.time() - e['ts'] < TELEGRAM_CACHE_TTL:
-            return e['url']
-    return None
-
-def _telegram_cache_set(key: str, url: str):
-    with _telegram_cache_lock:
-        _telegram_cache[key] = {'url': url, 'ts': time.time()}
-
-
-# ── Logging ───────────────────────────────────────────────────────────────
 
 def log(msg: str):
     print(msg, flush=True)
 
 
-# ── Supabase REST helpers ─────────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────────────
 
 def supabase_lookup(query: str) -> dict | None:
     try:
         q = query.strip().lower()
-
-        # 1. Exact query match
         resp = requests.get(
             SUPABASE_TABLE,
             headers=SUPABASE_HEADERS,
@@ -85,33 +59,28 @@ def supabase_lookup(query: str) -> dict | None:
         )
         rows = resp.json()
         if isinstance(rows, list) and rows:
-            log(f"[SUPABASE] ✅ Cache hit (query): {query}")
+            log(f"[SUPABASE] ✅ Hit: {query}")
             return rows[0]
 
-        # 2. Artist + title split
+        # Try artist - title split
         parts = re.split(r'\s*-\s*', q, maxsplit=1)
         if len(parts) == 2:
             artist, title = parts[0].strip(), parts[1].strip()
             resp = requests.get(
                 SUPABASE_TABLE,
                 headers=SUPABASE_HEADERS,
-                params={
-                    "artist": f"ilike.%{artist}%",
-                    "title":  f"ilike.%{title}%",
-                    "limit":  1,
-                },
+                params={"artist": f"ilike.%{artist}%", "title": f"ilike.%{title}%", "limit": 1},
                 timeout=5,
             )
             rows = resp.json()
             if isinstance(rows, list) and rows:
-                log(f"[SUPABASE] ✅ Cache hit (artist+title): {query}")
+                log(f"[SUPABASE] ✅ Hit (artist+title): {query}")
                 return rows[0]
 
         log(f"[SUPABASE] Miss: {query}")
         return None
-
     except Exception as exc:
-        log(f"[SUPABASE] ❌ Lookup error: {exc}")
+        log(f"[SUPABASE] ❌ Error: {exc}")
         return None
 
 
@@ -120,7 +89,6 @@ def supabase_save(query: str, file_id: str, content_type: str):
         parts = re.split(r'\s*-\s*', query.strip(), maxsplit=1)
         artist = parts[0].strip() if len(parts) == 2 else None
         title  = parts[1].strip() if len(parts) == 2 else query.strip()
-
         row = {
             "query":        query.strip().lower(),
             "title":        title,
@@ -130,89 +98,44 @@ def supabase_save(query: str, file_id: str, content_type: str):
         }
         headers = {**SUPABASE_HEADERS, "Prefer": "resolution=merge-duplicates"}
         resp = requests.post(SUPABASE_TABLE, headers=headers, json=row, timeout=10)
-
         if resp.status_code in (200, 201, 204):
             log(f"[SUPABASE] 💾 Saved: {query}")
         else:
             log(f"[SUPABASE] ❌ Save failed ({resp.status_code}): {resp.text}")
-
     except Exception as exc:
         log(f"[SUPABASE] ❌ Save error: {exc}")
 
 
-# ── Telegram helpers ──────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────
 
-def telegram_get_stream_url(file_id: str) -> str | None:
-    """Exchange a Telegram file_id for a fresh temporary CDN URL."""
+def telegram_get_url(file_id: str) -> str | None:
     try:
-        resp = requests.get(
-            f"{TELEGRAM_API}/getFile",
-            params={"file_id": file_id},
-            timeout=10,
-        )
+        resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
         result = resp.json()
         if result.get("ok"):
-            file_path = result["result"]["file_path"]
-            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{result['result']['file_path']}"
         log(f"[TELEGRAM] ❌ getFile failed: {result.get('description')}")
         return None
     except Exception as exc:
-        log(f"[TELEGRAM] ❌ getFile exception: {exc}")
+        log(f"[TELEGRAM] ❌ getFile error: {exc}")
         return None
 
 
-def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"):
-    file_buffer.seek(0)
+def telegram_upload(buffer: io.BytesIO, filename: str) -> tuple[str | None, str | None]:
+    buffer.seek(0)
     resp = requests.post(
         f"{TELEGRAM_API}/sendDocument",
         data={"chat_id": CHAT_ID},
-        files={"document": (filename, file_buffer)},
+        files={"document": (filename, buffer)},
         timeout=300,
     )
     result = resp.json()
     if result.get("ok"):
         return result["result"]["document"]["file_id"], None
-    return None, result.get("description", "unknown error")
+    return None, result.get("description", "unknown")
 
 
-def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str, content_type: str):
-    try:
-        size = buffer.tell()
-        log(f"[TELEGRAM] ── Uploading '{query}' ({size:,} bytes) ──")
-
-        if size < 1024:
-            log(f"[TELEGRAM] ❌ Too small ({size} bytes), skipping")
-            return
-
-        if size > TELEGRAM_MAX_BYTES:
-            log(f"[TELEGRAM] ❌ Too large ({size:,} bytes > 50 MB), skipping")
-            return
-
-        ext = ('webm' if 'webm' in content_type else
-               'm4a'  if 'mp4'  in content_type else
-               'mp3'  if 'mpeg' in content_type else 'webm')
-        filename = f"{query.replace(' ', '_')}.{ext}"
-
-        file_id, err = telegram_upload_buffer(buffer, filename=filename)
-
-        if err:
-            log(f"[TELEGRAM] ❌ Upload failed: {err}")
-        else:
-            log(f"[TELEGRAM] ✅ Uploaded! file_id={file_id}")
-            supabase_save(query, file_id, content_type)
-
-    except requests.exceptions.Timeout:
-        log(f"[TELEGRAM] ❌ Timed out uploading '{query}'")
-    except Exception as exc:
-        log(f"[TELEGRAM] ❌ Exception: {type(exc).__name__}: {exc}")
-    finally:
-        buffer.close()
-        with _upload_lock:
-            _uploading.discard(cache_key)
-        log(f"[TELEGRAM] ── Upload done for '{query}' ──")
-
-
-# ── yt-dlp helpers ────────────────────────────────────────────────────────
+# ── yt-dlp ────────────────────────────────────────────────────────────────
 YTMUSIC_AVAILABLE = False
 try:
     from ytmusicapi import YTMusic
@@ -222,7 +145,7 @@ except ImportError:
     ytm = None
 
 
-def search_youtube_music(query: str):
+def search_youtube(query: str) -> str | None:
     if YTMUSIC_AVAILABLE:
         results = ytm.search(query, filter="songs", limit=1) or ytm.search(query, limit=1)
         if results:
@@ -230,10 +153,8 @@ def search_youtube_music(query: str):
             if vid:
                 return f"https://music.youtube.com/watch?v={vid}"
         return None
-    opts = {
-        'quiet': True, 'skip_download': True, 'extract_flat': True,
-        'extractor_args': {'youtube': {'player_client': ['web_music']}},
-    }
+    opts = {'quiet': True, 'skip_download': True, 'extract_flat': True,
+            'extractor_args': {'youtube': {'player_client': ['web_music']}}}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch1:{query}", download=False)
         entries = info.get('entries', [])
@@ -243,11 +164,9 @@ def search_youtube_music(query: str):
 _MIME = {'webm': 'audio/webm', 'm4a': 'audio/mp4',
          'mp4': 'audio/mp4', 'ogg': 'audio/ogg', 'mp3': 'audio/mpeg'}
 
-def get_audio_stream(video_url: str):
-    opts = {
-        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-        'quiet': True, 'skip_download': True,
-    }
+def get_cdn_url(video_url: str) -> tuple[str | None, str]:
+    opts = {'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            'quiet': True, 'skip_download': True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         fmts = info.get('formats', [])
@@ -255,186 +174,190 @@ def get_audio_stream(video_url: str):
         if not audio:
             audio = [f for f in fmts if f.get('acodec') != 'none']
         if not audio:
-            return None, None
+            return None, 'audio/webm'
         audio.sort(key=lambda x: x.get('abr') or x.get('tbr') or 0, reverse=True)
         best = audio[0]
-        ct = _MIME.get(best.get('ext', ''), 'audio/webm')
-        return best['url'], ct
+        return best['url'], _MIME.get(best.get('ext', ''), 'audio/webm')
 
 
-def resolve_youtube(query: str, cache_key: str):
-    if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
-        video_url = query
-    else:
-        video_url = search_youtube_music(query)
-        if not video_url:
-            return None, None
-    url, ct = get_audio_stream(video_url)
-    if url:
-        _cache_set(cache_key, url, ct)
-    return url, ct
-
-
-# ── Streaming helpers ─────────────────────────────────────────────────────
+# ── Shared stream ─────────────────────────────────────────────────────────
 CHUNK = 8 * 1024
-_SENTINEL = object()
 
 
-def _proxy(stream_url: str, content_type: str):
-    """Proxy a stream through the server — used for YouTube sources only."""
-    upstream_headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
-    if 'Range' in request.headers:
-        upstream_headers['Range'] = request.headers['Range']
-
-    yt = requests.get(stream_url, headers=upstream_headers, stream=True, timeout=(5, None))
-
-    resp_headers = {
-        'Content-Type':               content_type,
-        'Accept-Ranges':              'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control':              'no-store',
-    }
-    for h in ('Content-Length', 'Content-Range'):
-        if h in yt.headers:
-            resp_headers[h] = yt.headers[h]
-
+def _stream_from_active(key: str, content_type: str) -> Response:
+    """
+    Tap into an already-running download.
+    Replay everything in the buffer so far, then follow along live.
+    """
     def generate():
-        try:
-            for chunk in yt.iter_content(chunk_size=CHUNK):
-                if chunk:
-                    yield chunk
-        finally:
-            yt.close()
+        pos = 0
+        while True:
+            state = _active.get(key)
+            if not state:
+                break
 
-    return Response(stream_with_context(generate()), status=yt.status_code, headers=resp_headers)
+            with state['lock']:
+                data = state['buffer'].getvalue()
+                available = data[pos:]
+                done = state['done']
+
+            if available:
+                yield available
+                pos += len(available)
+            elif done:
+                break
+            else:
+                # Wait a little for more data
+                time.sleep(0.1)
+
+    return Response(
+        stream_with_context(generate()),
+        status=200,
+        headers={
+            'Content-Type':               content_type,
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control':              'no-store',
+        },
+    )
 
 
-def _proxy_and_upload(stream_url: str, content_type: str, query: str):
+def _download_and_serve(query: str, cdn_url: str, content_type: str) -> Response:
     """
-    Streams to client AND uploads to Telegram in background.
-    Handles both Range and non-Range requests.
+    Download from YouTube CDN once.
+    - Streams to the first listener in real time
+    - Any other listener who arrives mid-download gets _stream_from_active()
+    - After full download, uploads to Telegram and saves to Supabase
     """
-    cache_key = query.lower()
+    key = query.lower()
 
-    # Check if already uploading
-    with _upload_lock:
-        if cache_key in _uploading:
-            log(f"[PROXY] Already uploading: {query}")
-            return _proxy(stream_url, content_type)
-        _uploading.add(cache_key)
+    state = {
+        'buffer':       io.BytesIO(),
+        'done':         False,
+        'lock':         threading.Lock(),
+        'content_type': content_type,
+    }
 
-    chunk_queue: queue.Queue = queue.Queue()
-    buffer = io.BytesIO()
+    with _active_lock:
+        _active[key] = state
 
     def downloader():
-        download_ok = False
+        ok = False
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
-            if 'Range' in request.headers:
-                headers['Range'] = request.headers['Range']
-
-            resp = requests.get(stream_url, headers=headers,
-                                stream=True, timeout=(10, 120))
+            resp = requests.get(
+                cdn_url,
+                headers={'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'},
+                stream=True,
+                timeout=(10, 120),
+            )
             resp.raise_for_status()
 
             for chunk in resp.iter_content(chunk_size=CHUNK):
                 if not chunk:
                     continue
-                buffer.write(chunk)
-                chunk_queue.put(chunk)
+                with state['lock']:
+                    state['buffer'].write(chunk)
 
-            download_ok = True
-            log(f"[PROXY] ✅ Full download complete — {buffer.tell():,} bytes — '{query}'")
+            ok = True
+            log(f"[DOWNLOAD] ✅ Complete — {state['buffer'].tell():,} bytes — '{query}'")
 
         except Exception as exc:
-            log(f"[PROXY] ❌ Download error '{query}': {type(exc).__name__}: {exc}")
+            log(f"[DOWNLOAD] ❌ Error: {type(exc).__name__}: {exc}")
         finally:
-            chunk_queue.put(_SENTINEL)
+            with state['lock']:
+                state['done'] = True
 
-        if download_ok:
-            _upload_to_telegram(buffer, query, cache_key, content_type)
-        else:
-            buffer.close()
-            with _upload_lock:
-                _uploading.discard(cache_key)
+        if ok:
+            _upload_and_save(state['buffer'], query, content_type)
+
+        with _active_lock:
+            _active.pop(key, None)
 
     threading.Thread(target=downloader, daemon=True).start()
 
-    resp_headers = {
-        'Content-Type':               content_type,
-        'Accept-Ranges':              'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control':              'no-store',
-    }
-
-    def generate():
-        while True:
-            try:
-                chunk = chunk_queue.get(timeout=60)
-            except queue.Empty:
-                log(f"[PROXY] Queue timeout — ending stream: {query}")
-                break
-            if chunk is _SENTINEL:
-                break
-            yield chunk
-
-    return Response(stream_with_context(generate()), status=200, headers=resp_headers)
+    # First listener: stream directly from the buffer as it fills
+    return _stream_from_active(key, content_type)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────
+def _upload_and_save(buffer: io.BytesIO, query: str, content_type: str):
+    try:
+        size = buffer.tell()
+        log(f"[TELEGRAM] Uploading '{query}' ({size:,} bytes)")
+
+        if size < 1024:
+            log(f"[TELEGRAM] ❌ Too small, skipping")
+            return
+        if size > TELEGRAM_MAX_BYTES:
+            log(f"[TELEGRAM] ❌ Too large (> 50 MB), skipping")
+            return
+
+        ext = ('webm' if 'webm' in content_type else
+               'm4a'  if 'mp4'  in content_type else
+               'mp3'  if 'mpeg' in content_type else 'webm')
+        filename = f"{query.replace(' ', '_')}.{ext}"
+
+        file_id, err = telegram_upload(buffer, filename)
+        if err:
+            log(f"[TELEGRAM] ❌ Failed: {err}")
+        else:
+            log(f"[TELEGRAM] ✅ Uploaded! file_id={file_id}")
+            supabase_save(query, file_id, content_type)
+
+    except Exception as exc:
+        log(f"[TELEGRAM] ❌ Exception: {exc}")
+    finally:
+        buffer.close()
+
+
+# ── Route ─────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def home():
-    return "Usage: GET /audio?q=Artist+-+Song+Title", 200
+    return "Usage: GET /audio?q=Artist+-+Song", 200
 
 
 @app.route('/audio', methods=['GET', 'HEAD'])
 def get_audio():
     query = request.args.get('q', '').strip()
     if not query:
-        return "Error: missing q parameter", 400
+        return "Error: missing ?q=", 400
 
-    cache_key = query.lower()
+    key = query.lower()
 
-    # ── 1. Check in-memory Telegram cache first (fastest) ─────────────────
-    telegram_url = _telegram_cache_get(cache_key)
-    if telegram_url:
-        log(f"[AUDIO] In-memory Telegram cache hit: {query}")
-        return redirect(telegram_url, code=302)
-
-    # ── 2. Check Supabase ─────────────────────────────────────────────────
+    # ── 1. Check Supabase — redirect to Telegram if we have it ───────────
     row = supabase_lookup(query)
     if row:
-        file_id = row["file_id"]
-        log(f"[AUDIO] Supabase cache hit — fetching Telegram URL for: {query}")
+        tg_url = telegram_get_url(row["file_id"])
+        if tg_url:
+            log(f"[AUDIO] Serving from Telegram: {query}")
+            return redirect(tg_url, code=302)
+        log(f"[AUDIO] Telegram URL fetch failed, falling back to YouTube")
 
-        stream_url = telegram_get_stream_url(file_id)
-        if stream_url:
-            _telegram_cache_set(cache_key, stream_url)
-            log(f"[AUDIO] Redirecting to Telegram CDN for: {query}")
-            return redirect(stream_url, code=302)
+    # ── 2. Already downloading? Tap into the existing stream ─────────────
+    with _active_lock:
+        state = _active.get(key)
 
-        log(f"[AUDIO] Telegram URL fetch failed, falling back to YouTube: {query}")
+    if state:
+        log(f"[AUDIO] Tapping into active stream: {query}")
+        return _stream_from_active(key, state['content_type'])
 
-    # ── 3. Check in-memory YouTube stream cache ───────────────────────────
-    stream_url, ct = _cache_get(cache_key)
-    if stream_url:
-        log(f"[AUDIO] In-memory YouTube stream cache hit: {query}")
-    else:
-        # ── 4. Not cached — scrape YouTube ────────────────────────────────
-        log(f"[AUDIO] Scraping YouTube for: {query}")
-        try:
-            stream_url, ct = resolve_youtube(query, cache_key)
-        except Exception as exc:
-            return f"Error resolving stream: {exc}", 500
-        if not stream_url:
+    # ── 3. Not cached, not active — scrape YouTube ────────────────────────
+    log(f"[AUDIO] Scraping YouTube: {query}")
+    try:
+        if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
+            video_url = query
+        else:
+            video_url = search_youtube(query)
+        if not video_url:
+            return "Error: song not found on YouTube", 404
+
+        cdn_url, ct = get_cdn_url(video_url)
+        if not cdn_url:
             return "Error: no audio stream found", 404
 
-    # ── 5. Stream to client AND upload in background ──────────────────────
-    try:
-        return _proxy_and_upload(stream_url, ct or 'audio/webm', query)
-    except requests.exceptions.RequestException as exc:
-        return f"Error connecting to stream: {exc}", 502
+    except Exception as exc:
+        return f"Error: {exc}", 500
+
+    return _download_and_serve(query, cdn_url, ct)
 
 
 if __name__ == '__main__':
