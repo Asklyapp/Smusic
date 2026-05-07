@@ -2,7 +2,6 @@ import os
 import re
 import time
 import threading
-import queue
 import io
 import requests
 from flask import Flask, request, Response, stream_with_context, redirect
@@ -17,7 +16,7 @@ SUPABASE_HEADERS = {
     "apikey":        SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type":  "application/json",
-    "Prefer":        "return=minimal",
+    "Accept":        "application/json",
 }
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/songs"
 
@@ -61,15 +60,23 @@ def log(msg: str):
 def supabase_lookup(query: str) -> dict | None:
     try:
         q = query.strip().lower()
+        log(f"[SUPABASE] Looking up: '{q}'")
 
         # 1. Exact query match
-        resp = requests.get(
-            SUPABASE_TABLE,
-            headers=SUPABASE_HEADERS,
-            params={"query": f"ilike.{q}", "limit": 1},
-            timeout=5,
-        )
+        url = f"{SUPABASE_TABLE}?query=ilike.{q}&limit=1"
+        log(f"[SUPABASE] URL: {url}")
+
+        resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=5)
+        log(f"[SUPABASE] Lookup status: {resp.status_code}")
+
+        if resp.status_code == 401:
+            log(f"[SUPABASE] ❌ 401 UNAUTHORIZED — Check your API key or RLS settings")
+            log(f"[SUPABASE] Response: {resp.text}")
+            return None
+
         rows = resp.json()
+        log(f"[SUPABASE] Lookup rows: {rows}")
+
         if isinstance(rows, list) and rows:
             log(f"[SUPABASE] ✅ Cache hit (query): {query}")
             return rows[0]
@@ -78,17 +85,19 @@ def supabase_lookup(query: str) -> dict | None:
         parts = re.split(r'\s*-\s*', q, maxsplit=1)
         if len(parts) == 2:
             artist, title = parts[0].strip(), parts[1].strip()
-            resp = requests.get(
-                SUPABASE_TABLE,
-                headers=SUPABASE_HEADERS,
-                params={
-                    "artist": f"ilike.%{artist}%",
-                    "title":  f"ilike.%{title}%",
-                    "limit":  1,
-                },
-                timeout=5,
-            )
+            url = f"{SUPABASE_TABLE}?artist=ilike.%{artist}%&title=ilike.%{title}%&limit=1"
+            log(f"[SUPABASE] Fallback URL: {url}")
+
+            resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=5)
+            log(f"[SUPABASE] Fallback status: {resp.status_code}")
+
+            if resp.status_code == 401:
+                log(f"[SUPABASE] ❌ 401 UNAUTHORIZED on fallback")
+                return None
+
             rows = resp.json()
+            log(f"[SUPABASE] Fallback rows: {rows}")
+
             if isinstance(rows, list) and rows:
                 log(f"[SUPABASE] ✅ Cache hit (artist+title): {query}")
                 return rows[0]
@@ -98,6 +107,8 @@ def supabase_lookup(query: str) -> dict | None:
 
     except Exception as exc:
         log(f"[SUPABASE] ❌ Lookup error: {exc}")
+        import traceback
+        log(f"[SUPABASE] Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -114,16 +125,32 @@ def supabase_save(query: str, file_id: str, content_type: str):
             "file_id":      file_id,
             "content_type": content_type,
         }
-        headers = {**SUPABASE_HEADERS, "Prefer": "resolution=merge-duplicates"}
+
+        headers = {
+            **SUPABASE_HEADERS,
+            "Prefer": "resolution=merge-duplicates",
+        }
+
+        log(f"[SUPABASE] Saving row: {row}")
+        log(f"[SUPABASE] Save URL: {SUPABASE_TABLE}")
+        log(f"[SUPABASE] Headers: {headers}")
+
         resp = requests.post(SUPABASE_TABLE, headers=headers, json=row, timeout=10)
+
+        log(f"[SUPABASE] Save status: {resp.status_code}")
+        log(f"[SUPABASE] Save response: {resp.text}")
 
         if resp.status_code in (200, 201, 204):
             log(f"[SUPABASE] 💾 Saved: {query}")
+        elif resp.status_code == 401:
+            log(f"[SUPABASE] ❌ 401 UNAUTHORIZED — Check API key or RLS")
         else:
             log(f"[SUPABASE] ❌ Save failed ({resp.status_code}): {resp.text}")
 
     except Exception as exc:
         log(f"[SUPABASE] ❌ Save error: {exc}")
+        import traceback
+        log(f"[SUPABASE] Traceback: {traceback.format_exc()}")
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────
@@ -358,15 +385,19 @@ def get_audio():
         return "Error: missing q parameter", 400
 
     cache_key = query.lower()
+    log(f"[AUDIO] Request: '{query}'")
 
     # ── 1. Supabase — redirect straight to Telegram if we have it ────────
     row = supabase_lookup(query)
     if row:
+        log(f"[AUDIO] Found in Supabase: {row}")
         tg_url = telegram_get_stream_url(row["file_id"])
         if tg_url:
             log(f"[AUDIO] Redirecting to Telegram CDN: {query}")
             return redirect(tg_url, code=302)
         log(f"[AUDIO] Telegram URL failed, falling back to YouTube")
+    else:
+        log(f"[AUDIO] Not found in Supabase, will use YouTube")
 
     # ── 2. Resolve YouTube URL ────────────────────────────────────────────
     stream_url, ct = _cache_get(cache_key)
@@ -380,7 +411,6 @@ def get_audio():
             return "Error: no audio stream found", 404
 
     # ── 3. Start background download for Telegram upload ─────────────────
-    # This runs completely separately from streaming
     _download_and_upload(stream_url, ct or 'audio/webm', query)
 
     # ── 4. Stream to user immediately (pass-through, no buffering) ──────
