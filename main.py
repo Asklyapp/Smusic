@@ -6,7 +6,7 @@ import queue
 import io
 import requests
 import uuid
-from flask import Flask, request, Response, stream_with_context, redirect, jsonify
+from flask import Flask, request, Response, stream_with_context, redirect
 import yt_dlp
 
 app = Flask(__name__)
@@ -34,8 +34,6 @@ _uploading: set = set()
 _upload_lock = threading.Lock()
 
 # ── Active downloads ──────────────────────────────────────────────────────
-# If a song is already downloading, new listeners get their own queue
-# and receive every chunk — no second YouTube call ever.
 _active: dict = {}
 _active_lock = threading.Lock()
 
@@ -45,7 +43,6 @@ _cache_lock = threading.Lock()
 CACHE_TTL = 4 * 3600
 
 # ── Progressive streaming sessions ───────────────────────────────────────
-# NEW: Stores partial buffers for instant streaming while downloading
 _sessions: dict = {}
 _sessions_lock = threading.Lock()
 SESSION_CLEANUP_INTERVAL = 300  # 5 minutes
@@ -275,9 +272,6 @@ def resolve_youtube(query: str, cache_key: str):
 
 
 # ── Progressive Streaming Session Management ─────────────────────────────
-# NEW ARCHITECTURE: Instead of proxying the whole file through Python,
-# we create a session that the client can stream from directly while we
-# download/upload in the background.
 
 CHUNK = 8 * 1024
 _SENTINEL = object()
@@ -304,7 +298,7 @@ def _create_session(query: str, content_type: str) -> str:
             'query': query,
             'content_type': content_type,
             'buffer': io.BytesIO(),
-            'chunks': [],  # List of (offset, size) for range requests
+            'chunks': [],
             'total_size': 0,
             'complete': False,
             'failed': False,
@@ -327,8 +321,8 @@ def _get_session(session_id: str):
 
 def _session_stream(session_id: str, range_header: str = None):
     """
-    Stream from a session. Supports range requests.
-    This is what the client hits when streaming from /stream/<session_id>
+    Stream from an active session. Supports range requests for seeking.
+    This is what your app/player hits to actually get the audio data.
     """
     session = _get_session(session_id)
     if not session:
@@ -356,14 +350,12 @@ def _session_stream(session_id: str, range_header: str = None):
 
         while True:
             with condition:
-                # Wait until we have data or download is complete/failed
                 while last_pos >= session['total_size'] and not session.get('complete') and not session.get('failed'):
                     condition.wait(timeout=1.0)
 
                 if session.get('failed'):
                     break
 
-                # Read available data
                 buffer.seek(last_pos)
                 available = session['total_size'] - last_pos
 
@@ -384,10 +376,8 @@ def _session_stream(session_id: str, range_header: str = None):
                 elif session.get('complete'):
                     break
                 else:
-                    # No data yet, loop around and wait
                     pass
 
-    # Determine headers
     headers = {
         'Content-Type': ct,
         'Accept-Ranges': 'bytes',
@@ -396,14 +386,12 @@ def _session_stream(session_id: str, range_header: str = None):
     }
 
     if range_header and session.get('complete'):
-        # We know total size, can serve proper range response
         total = session['total_size']
         end_val = end if end is not None else total - 1
         headers['Content-Length'] = str(end_val - start + 1)
         headers['Content-Range'] = f'bytes {start}-{end_val}/{total}'
         status = 206
     elif range_header and not session.get('complete'):
-        # Don't know total size yet, stream what we have
         status = 206
     else:
         status = 200
@@ -440,7 +428,7 @@ def _download_to_session(session_id: str, stream_url: str, query: str):
                 buffer.write(chunk)
                 session['total_size'] = buffer.tell()
                 session['chunks'].append((pos, len(chunk)))
-                condition.notify_all()  # Wake up all waiting streamers
+                condition.notify_all()
 
         download_ok = True
         log(f"[SESSION] ✅ Download complete — {buffer.tell():,} bytes — '{query}'")
@@ -456,12 +444,10 @@ def _download_to_session(session_id: str, stream_url: str, query: str):
             session['complete'] = True
             condition.notify_all()
 
-    # Upload to Telegram if download succeeded
     if download_ok:
         with _upload_lock:
             if cache_key not in _uploading:
                 _uploading.add(cache_key)
-                # Create a new buffer for upload (copy)
                 upload_buffer = io.BytesIO()
                 buffer.seek(0)
                 upload_buffer.write(buffer.read())
@@ -508,7 +494,7 @@ def _proxy(stream_url: str, content_type: str):
 def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     """
     LEGACY fallback: One YouTube CDN request with tap-in support.
-    Only used if progressive streaming is disabled or fails.
+    Uploads to Telegram after complete download.
     """
     cache_key = query.lower()
     my_queue: queue.Queue = queue.Queue()
@@ -616,18 +602,15 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
 
 @app.route('/')
 def home():
-    return """Usage:
-GET /audio?q=Artist+-+Song+Title  → Start progressive streaming (returns session JSON)
-GET /stream/<session_id>          → Stream audio from session (use this URL in your app)
-GET /audio/legacy?q=...           → Old direct proxy mode
-""", 200
+    return "Usage: GET /audio?q=Artist+-+Song+Title", 200
 
 
 @app.route('/audio', methods=['GET', 'HEAD'])
 def get_audio():
     """
-    NEW: Returns a session URL immediately. The client can start streaming
-    from /stream/<session_id> while we download in the background.
+    Returns a 302 redirect to /stream/<session_id>.
+    The app/player follows the redirect and streams from there instantly
+    while we download from YouTube in the background.
     """
     query = request.args.get('q', '').strip()
     if not query:
@@ -644,22 +627,7 @@ def get_audio():
             return redirect(tg_url, code=302)
         log(f"[AUDIO] Telegram URL failed, falling back to YouTube")
 
-    # ── 2. Check if already downloading ────────────────────────────────
-    with _active_lock:
-        if cache_key in _active:
-            # Someone else is already downloading via legacy, tap in
-            log(f"[AUDIO] Active legacy download found for: {query}")
-            # Fall through to legacy mode for simplicity
-            pass
-
-    # ── 3. Check if already uploaded/uploading ───────────────────────
-    with _upload_lock:
-        if cache_key in _uploading:
-            log(f"[AUDIO] Already uploading '{query}', will stream via legacy")
-            # Fall through to legacy
-            pass
-
-    # ── 4. Resolve YouTube URL ──────────────────────────────────────
+    # ── 2. Resolve YouTube URL ──────────────────────────────────────
     stream_url, ct = _cache_get(cache_key)
     if not stream_url:
         log(f"[AUDIO] Scraping YouTube for: {query}")
@@ -670,9 +638,7 @@ def get_audio():
         if not stream_url:
             return "Error: no audio stream found", 404
 
-    # ── 5. Create progressive streaming session ─────────────────────
-    # This is the NEW behavior: we return a session URL immediately,
-    # and the client streams from there while we download in background.
+    # ── 3. Create session and redirect ──────────────────────────────
     session_id = _create_session(query, ct or 'audio/webm')
 
     # Start background download immediately
@@ -682,84 +648,23 @@ def get_audio():
         daemon=True
     ).start()
 
-    # Build the stream URL
+    # Build the stream URL and redirect the app straight to it
     host = request.host_url.rstrip('/')
-    stream_url = f"{host}/stream/{session_id}"
+    redirect_url = f"{host}/stream/{session_id}"
 
-    log(f"[AUDIO] ✅ Created session {session_id} for '{query}'")
+    log(f"[AUDIO] ✅ Redirecting to session {session_id} for '{query}'")
 
-    # Return JSON with the stream URL (your app uses this to start playback)
-    return jsonify({
-        "query": query,
-        "session_id": session_id,
-        "stream_url": stream_url,
-        "content_type": ct or 'audio/webm',
-        "status": "buffering",
-        "message": "Stream ready. Start playback immediately using stream_url."
-    })
+    return redirect(redirect_url, code=302)
 
 
 @app.route('/stream/<session_id>', methods=['GET', 'HEAD'])
 def stream_session(session_id):
     """
-    NEW: Stream from an active session. Supports range requests for seeking.
+    Stream from an active session. Supports range requests for seeking.
     This is what your app/player hits to actually get the audio data.
     """
     range_header = request.headers.get('Range')
     return _session_stream(session_id, range_header)
-
-
-@app.route('/audio/legacy', methods=['GET', 'HEAD'])
-def get_audio_legacy():
-    """
-    OLD behavior: Direct proxy through Python. Use if progressive streaming
-    has issues. Uploads to Telegram after complete download.
-    """
-    query = request.args.get('q', '').strip()
-    if not query:
-        return "Error: missing q parameter", 400
-
-    cache_key = query.lower()
-
-    # ── 1. Supabase ──────────────────────────────────────────────────
-    row = supabase_lookup(query)
-    if row:
-        tg_url = telegram_get_stream_url(row["file_id"])
-        if tg_url:
-            log(f"[AUDIO/LEGACY] Redirecting to Telegram: {query}")
-            return redirect(tg_url, code=302)
-
-    # ── 2. Resolve YouTube ────────────────────────────────────────────
-    stream_url, ct = _cache_get(cache_key)
-    if not stream_url:
-        log(f"[AUDIO/LEGACY] Scraping YouTube for: {query}")
-        try:
-            stream_url, ct = resolve_youtube(query, cache_key)
-        except Exception as exc:
-            return f"Error resolving stream: {exc}", 500
-        if not stream_url:
-            return "Error: no audio stream found", 404
-
-    # ── 3. Proxy and upload ─────────────────────────────────────────
-    # FIXED: Removed the broken Range header check that was preventing uploads!
-    return _proxy_and_upload(stream_url, ct or 'audio/webm', query)
-
-
-@app.route('/session/<session_id>/status')
-def session_status(session_id):
-    """Check download progress of a session."""
-    session = _get_session(session_id)
-    if not session:
-        return {"error": "Session not found"}, 404
-
-    return jsonify({
-        "session_id": session_id,
-        "query": session['query'],
-        "total_size": session['total_size'],
-        "complete": session.get('complete', False),
-        "failed": session.get('failed', False),
-        "uploaded": session.get('uploaded', False),
-    })
 
 
 # ── Cleanup thread ────────────────────────────────────────────────────────
