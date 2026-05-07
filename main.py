@@ -312,7 +312,7 @@ def _proxy_and_upload(stream_url: str, content_type: str, query: str):
     cache_key = query.lower()
 
     # Range/seek — pass straight through with the Range header intact
-    if 'Range' in request.headers and stream_url:
+    if 'Range' in request.headers:
         log(f"[PROXY] Range request — plain proxy: {query}")
         return _proxy(stream_url, content_type)
 
@@ -434,7 +434,7 @@ def get_audio():
 
     cache_key = query.lower()
 
-    # ── 1. Supabase — redirect to Telegram, no YouTube needed ────────────
+    # ── 1. Supabase — redirect straight to Telegram if we have it ────────
     row = supabase_lookup(query)
     if row:
         tg_url = telegram_get_stream_url(row["file_id"])
@@ -443,16 +443,13 @@ def get_audio():
             return redirect(tg_url, code=302)
         log(f"[AUDIO] Telegram URL failed, falling back to YouTube")
 
-    # ── 2. Already downloading? Tap in — no YouTube scrape needed ────────
-    with _active_lock:
-        if cache_key in _active:
-            log(f"[AUDIO] Tapping into active download: {query}")
-            return _proxy_and_upload(None, _active[cache_key]['ct'], query)
-
-    # ── 3. Scrape YouTube — only runs if not in Supabase or active ────────
-    log(f"[AUDIO] Scraping YouTube for: {query}")
+    # ── 2. Resolve YouTube URL (cache first, then yt-dlp) ────────────────
+    # _proxy_and_upload handles the tap-in case internally — if the song
+    # is already downloading it registers a new queue and returns immediately
+    # without ever using this URL for a second download.
     stream_url, ct = _cache_get(cache_key)
     if not stream_url:
+        log(f"[AUDIO] Scraping YouTube for: {query}")
         try:
             stream_url, ct = resolve_youtube(query, cache_key)
         except Exception as exc:
@@ -460,10 +457,7 @@ def get_audio():
         if not stream_url:
             return "Error: no audio stream found", 404
 
-    try:
-        return _proxy_and_upload(stream_url, ct or 'audio/webm', query)
-    except requests.exceptions.RequestException as exc:
-        return f"Error connecting to stream: {exc}", 502
+    return _proxy_and_upload(stream_url, ct or 'audio/webm', query)
 
 
 if __name__ == '__main__':
