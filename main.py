@@ -5,7 +5,6 @@ import threading
 import queue
 import io
 import requests
-import uuid
 from flask import Flask, request, Response, stream_with_context, redirect
 import yt_dlp
 
@@ -33,19 +32,10 @@ TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 _uploading: set = set()
 _upload_lock = threading.Lock()
 
-# ── Active downloads ──────────────────────────────────────────────────────
-_active: dict = {}
-_active_lock = threading.Lock()
-
 # ── In-memory CDN URL cache ───────────────────────────────────────────────
 _cache: dict = {}
 _cache_lock = threading.Lock()
 CACHE_TTL = 4 * 3600
-
-# ── Progressive streaming sessions ───────────────────────────────────────
-_sessions: dict = {}
-_sessions_lock = threading.Lock()
-SESSION_CLEANUP_INTERVAL = 300  # 5 minutes
 
 
 def _cache_get(key: str):
@@ -178,10 +168,16 @@ def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str, content_
 
         if size < 1024:
             log(f"[TELEGRAM] ❌ Too small ({size} bytes), skipping")
+            buffer.close()
+            with _upload_lock:
+                _uploading.discard(cache_key)
             return
 
         if size > TELEGRAM_MAX_BYTES:
             log(f"[TELEGRAM] ❌ Too large ({size:,} bytes > 50 MB), skipping")
+            buffer.close()
+            with _upload_lock:
+                _uploading.discard(cache_key)
             return
 
         ext = ('webm' if 'webm' in content_type else
@@ -271,199 +267,15 @@ def resolve_youtube(query: str, cache_key: str):
     return url, ct
 
 
-# ── Progressive Streaming Session Management ─────────────────────────────
-
+# ── Streaming helpers ─────────────────────────────────────────────────────
 CHUNK = 8 * 1024
-_SENTINEL = object()
 
 
-def _cleanup_old_sessions():
-    """Remove sessions older than SESSION_CLEANUP_INTERVAL."""
-    now = time.time()
-    with _sessions_lock:
-        expired = [sid for sid, s in _sessions.items() 
-                   if now - s.get('created', 0) > SESSION_CLEANUP_INTERVAL and s.get('complete')]
-        for sid in expired:
-            if _sessions[sid].get('buffer'):
-                _sessions[sid]['buffer'].close()
-            del _sessions[sid]
-            log(f"[SESSION] Cleaned up expired session {sid}")
-
-
-def _create_session(query: str, content_type: str) -> str:
-    """Create a new streaming session and return its ID."""
-    session_id = str(uuid.uuid4())[:12]
-    with _sessions_lock:
-        _sessions[session_id] = {
-            'query': query,
-            'content_type': content_type,
-            'buffer': io.BytesIO(),
-            'chunks': [],
-            'total_size': 0,
-            'complete': False,
-            'failed': False,
-            'error': None,
-            'created': time.time(),
-            'last_access': time.time(),
-            'condition': threading.Condition(),
-            'uploaded': False,
-        }
-    return session_id
-
-
-def _get_session(session_id: str):
-    with _sessions_lock:
-        session = _sessions.get(session_id)
-        if session:
-            session['last_access'] = time.time()
-        return session
-
-
-def _session_stream(session_id: str, range_header: str = None):
+def _pass_through(stream_url: str, content_type: str):
     """
-    Stream from an active session. Supports range requests for seeking.
-    This is what your app/player hits to actually get the audio data.
+    Doorway: pipes bytes straight from YouTube to the user.
+    No buffering, no storing. Just forward chunks as they arrive.
     """
-    session = _get_session(session_id)
-    if not session:
-        return "Session not found", 404
-
-    if session.get('failed'):
-        return f"Download failed: {session.get('error')}", 500
-
-    ct = session['content_type']
-
-    # Parse range header
-    start = 0
-    end = None
-    if range_header:
-        match = re.match(r'bytes=(\d+)-(\d*)', range_header)
-        if match:
-            start = int(match.group(1))
-            if match.group(2):
-                end = int(match.group(2))
-
-    def generate():
-        buffer = session['buffer']
-        condition = session['condition']
-        last_pos = start
-
-        while True:
-            with condition:
-                while last_pos >= session['total_size'] and not session.get('complete') and not session.get('failed'):
-                    condition.wait(timeout=1.0)
-
-                if session.get('failed'):
-                    break
-
-                buffer.seek(last_pos)
-                available = session['total_size'] - last_pos
-
-                if available > 0:
-                    to_read = min(available, CHUNK)
-                    if end is not None:
-                        to_read = min(to_read, end - last_pos + 1)
-
-                    if to_read <= 0:
-                        break
-
-                    data = buffer.read(to_read)
-                    last_pos += len(data)
-                    yield data
-
-                    if end is not None and last_pos > end:
-                        break
-                elif session.get('complete'):
-                    break
-                else:
-                    pass
-
-    headers = {
-        'Content-Type': ct,
-        'Accept-Ranges': 'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-store',
-    }
-
-    if range_header and session.get('complete'):
-        total = session['total_size']
-        end_val = end if end is not None else total - 1
-        headers['Content-Length'] = str(end_val - start + 1)
-        headers['Content-Range'] = f'bytes {start}-{end_val}/{total}'
-        status = 206
-    elif range_header and not session.get('complete'):
-        status = 206
-    else:
-        status = 200
-
-    return Response(stream_with_context(generate()), status=status, headers=headers)
-
-
-def _download_to_session(session_id: str, stream_url: str, query: str):
-    """
-    Background downloader: fetches from YouTube into the session buffer,
-    then uploads to Telegram when complete.
-    """
-    session = _get_session(session_id)
-    if not session:
-        return
-
-    buffer = session['buffer']
-    condition = session['condition']
-    cache_key = query.lower()
-
-    download_ok = False
-
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
-        resp = requests.get(stream_url, headers=headers, stream=True, timeout=(10, 120))
-        resp.raise_for_status()
-
-        for chunk in resp.iter_content(chunk_size=CHUNK):
-            if not chunk:
-                continue
-
-            with condition:
-                pos = buffer.tell()
-                buffer.write(chunk)
-                session['total_size'] = buffer.tell()
-                session['chunks'].append((pos, len(chunk)))
-                condition.notify_all()
-
-        download_ok = True
-        log(f"[SESSION] ✅ Download complete — {buffer.tell():,} bytes — '{query}'")
-
-    except Exception as exc:
-        log(f"[SESSION] ❌ Download error '{query}': {type(exc).__name__}: {exc}")
-        with condition:
-            session['failed'] = True
-            session['error'] = str(exc)
-            condition.notify_all()
-    finally:
-        with condition:
-            session['complete'] = True
-            condition.notify_all()
-
-    if download_ok:
-        with _upload_lock:
-            if cache_key not in _uploading:
-                _uploading.add(cache_key)
-                upload_buffer = io.BytesIO()
-                buffer.seek(0)
-                upload_buffer.write(buffer.read())
-                threading.Thread(
-                    target=_upload_to_telegram,
-                    args=(upload_buffer, query, cache_key, session['content_type']),
-                    daemon=True
-                ).start()
-            else:
-                log(f"[TELEGRAM] Already uploading '{query}', skipping duplicate")
-
-
-# ── Legacy proxy (kept for fallback) ──────────────────────────────────────
-
-def _proxy(stream_url: str, content_type: str):
-    """Legacy: Proxy a stream through the server."""
     upstream_headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
     if 'Range' in request.headers:
         upstream_headers['Range'] = request.headers['Range']
@@ -491,111 +303,40 @@ def _proxy(stream_url: str, content_type: str):
     return Response(stream_with_context(generate()), status=yt.status_code, headers=resp_headers)
 
 
-def _proxy_and_upload(stream_url: str, content_type: str, query: str):
+def _download_and_upload(stream_url: str, content_type: str, query: str):
     """
-    LEGACY fallback: One YouTube CDN request with tap-in support.
-    Uploads to Telegram after complete download.
+    Background job: downloads the ENTIRE file from YouTube,
+    then uploads it to Telegram. Completely separate from streaming.
     """
     cache_key = query.lower()
-    my_queue: queue.Queue = queue.Queue()
-
-    with _active_lock:
-        if cache_key in _active:
-            log(f"[PROXY] Tapping into active download: {query}")
-            _active[cache_key]['queues'].append(my_queue)
-            ct = _active[cache_key]['ct']
-
-            def generate_tap():
-                while True:
-                    try:
-                        chunk = my_queue.get(timeout=60)
-                    except queue.Empty:
-                        break
-                    if chunk is _SENTINEL:
-                        break
-                    yield chunk
-
-            return Response(
-                stream_with_context(generate_tap()),
-                status=200,
-                headers={
-                    'Content-Type':               ct,
-                    'Accept-Ranges':              'bytes',
-                    'Access-Control-Allow-Origin': '*',
-                    'Cache-Control':              'no-store',
-                },
-            )
-
-        _active[cache_key] = {
-            'queues': [my_queue],
-            'lock':   threading.Lock(),
-            'ct':     content_type,
-        }
 
     with _upload_lock:
+        if cache_key in _uploading:
+            log(f"[UPLOAD] Already downloading/uploading '{query}', skipping")
+            return
         _uploading.add(cache_key)
 
-    buffer = io.BytesIO()
-    entry  = _active[cache_key]
-
     def downloader():
-        download_ok = False
+        buffer = io.BytesIO()
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
-            resp = requests.get(stream_url, headers=headers,
-                                stream=True, timeout=(10, 120))
+            resp = requests.get(stream_url, headers=headers, stream=True, timeout=(10, 300))
             resp.raise_for_status()
 
             for chunk in resp.iter_content(chunk_size=CHUNK):
-                if not chunk:
-                    continue
-                buffer.write(chunk)
-                with entry['lock']:
-                    for q in entry['queues']:
-                        q.put(chunk)
+                if chunk:
+                    buffer.write(chunk)
 
-            download_ok = True
-            log(f"[PROXY] ✅ Full download complete — {buffer.tell():,} bytes — '{query}'")
+            log(f"[UPLOAD] ✅ Downloaded '{query}' — {buffer.tell():,} bytes")
+            _upload_to_telegram(buffer, query, cache_key, content_type)
 
         except Exception as exc:
-            log(f"[PROXY] ❌ Download error '{query}': {type(exc).__name__}: {exc}")
-        finally:
-            with entry['lock']:
-                for q in entry['queues']:
-                    q.put(_SENTINEL)
-            with _active_lock:
-                _active.pop(cache_key, None)
-
-        if download_ok:
-            _upload_to_telegram(buffer, query, cache_key, content_type)
-        else:
+            log(f"[UPLOAD] ❌ Failed '{query}': {type(exc).__name__}: {exc}")
             buffer.close()
             with _upload_lock:
                 _uploading.discard(cache_key)
 
     threading.Thread(target=downloader, daemon=True).start()
-
-    def generate():
-        while True:
-            try:
-                chunk = my_queue.get(timeout=60)
-            except queue.Empty:
-                log(f"[PROXY] Queue timeout — ending stream: {query}")
-                break
-            if chunk is _SENTINEL:
-                break
-            yield chunk
-
-    return Response(
-        stream_with_context(generate()),
-        status=200,
-        headers={
-            'Content-Type':               content_type,
-            'Accept-Ranges':              'bytes',
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control':              'no-store',
-        },
-    )
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -608,9 +349,9 @@ def home():
 @app.route('/audio', methods=['GET', 'HEAD'])
 def get_audio():
     """
-    Returns a 302 redirect to /stream/<session_id>.
-    The app/player follows the redirect and streams from there instantly
-    while we download from YouTube in the background.
+    1. If song is in Supabase → redirect to Telegram CDN (fastest)
+    2. Otherwise → pass-through stream from YouTube (instant playback)
+       + start background download for Telegram upload
     """
     query = request.args.get('q', '').strip()
     if not query:
@@ -618,7 +359,7 @@ def get_audio():
 
     cache_key = query.lower()
 
-    # ── 1. Check Supabase first ────────────────────────────────────────
+    # ── 1. Supabase — redirect straight to Telegram if we have it ────────
     row = supabase_lookup(query)
     if row:
         tg_url = telegram_get_stream_url(row["file_id"])
@@ -627,7 +368,7 @@ def get_audio():
             return redirect(tg_url, code=302)
         log(f"[AUDIO] Telegram URL failed, falling back to YouTube")
 
-    # ── 2. Resolve YouTube URL ──────────────────────────────────────
+    # ── 2. Resolve YouTube URL ────────────────────────────────────────────
     stream_url, ct = _cache_get(cache_key)
     if not stream_url:
         log(f"[AUDIO] Scraping YouTube for: {query}")
@@ -638,43 +379,13 @@ def get_audio():
         if not stream_url:
             return "Error: no audio stream found", 404
 
-    # ── 3. Create session and redirect ──────────────────────────────
-    session_id = _create_session(query, ct or 'audio/webm')
+    # ── 3. Start background download for Telegram upload ─────────────────
+    # This runs completely separately from streaming
+    _download_and_upload(stream_url, ct or 'audio/webm', query)
 
-    # Start background download immediately
-    threading.Thread(
-        target=_download_to_session,
-        args=(session_id, stream_url, query),
-        daemon=True
-    ).start()
-
-    # Build the stream URL and redirect the app straight to it
-    host = request.host_url.rstrip('/')
-    redirect_url = f"{host}/stream/{session_id}"
-
-    log(f"[AUDIO] ✅ Redirecting to session {session_id} for '{query}'")
-
-    return redirect(redirect_url, code=302)
-
-
-@app.route('/stream/<session_id>', methods=['GET', 'HEAD'])
-def stream_session(session_id):
-    """
-    Stream from an active session. Supports range requests for seeking.
-    This is what your app/player hits to actually get the audio data.
-    """
-    range_header = request.headers.get('Range')
-    return _session_stream(session_id, range_header)
-
-
-# ── Cleanup thread ────────────────────────────────────────────────────────
-
-def _cleanup_worker():
-    while True:
-        time.sleep(SESSION_CLEANUP_INTERVAL)
-        _cleanup_old_sessions()
-
-threading.Thread(target=_cleanup_worker, daemon=True).start()
+    # ── 4. Stream to user immediately (pass-through, no buffering) ──────
+    log(f"[AUDIO] Streaming pass-through: {query}")
+    return _pass_through(stream_url, ct or 'audio/webm')
 
 
 if __name__ == '__main__':
