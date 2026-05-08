@@ -12,13 +12,11 @@ app = Flask(__name__)
 # ── Supabase REST config ──────────────────────────────────────────────────
 SUPABASE_URL = "https://bzlbyagjpblzgeiixyud.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ6bGJ5YWdqcGJsemdlaWl4eXVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzMzMDEwMTYsImV4cCI6MjA4ODg3NzAxNn0.HJp0_O2jf286nFwaQwecn0M1OIuNu9TDz_S3RBwXDZM"
-
-# FIX: Only send apikey header. DO NOT send Authorization header with anon key.
-# When both are present, Kong prioritizes Authorization and rejects it as invalid JWT.
 SUPABASE_HEADERS = {
-    "apikey":       SUPABASE_KEY,
-    "Content-Type": "application/json",
-    "Accept":       "application/vnd.pgrst.object+json, application/json",
+    "apikey":        SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type":  "application/json",
+    "Accept":        "application/json",
 }
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/songs"
 
@@ -64,19 +62,15 @@ def supabase_lookup(query: str) -> dict | None:
         q = query.strip().lower()
         log(f"[SUPABASE] Looking up: '{q}'")
 
-        # 1. Exact query match
-        url = f"{SUPABASE_TABLE}?query=ilike.{q}&limit=1"
-        log(f"[SUPABASE] URL: {url}")
+        # 1. Exact query match — let requests handle URL encoding via params dict
+        params = {"query": f"ilike.{q}", "limit": 1}
+        log(f"[SUPABASE] Params: {params}")
 
-        resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=5)
+        resp = requests.get(SUPABASE_TABLE, headers=SUPABASE_HEADERS, params=params, timeout=5)
         log(f"[SUPABASE] Lookup status: {resp.status_code}")
 
         if resp.status_code == 401:
-            log(f"[SUPABASE] ❌ 401 UNAUTHORIZED")
-            log(f"[SUPABASE] Response body: {resp.text}")
-            return None
-        if resp.status_code != 200:
-            log(f"[SUPABASE] ❌ Unexpected status: {resp.status_code}")
+            log(f"[SUPABASE] ❌ 401 UNAUTHORIZED — Check your API key or RLS settings")
             log(f"[SUPABASE] Response: {resp.text}")
             return None
 
@@ -87,21 +81,22 @@ def supabase_lookup(query: str) -> dict | None:
             log(f"[SUPABASE] ✅ Cache hit (query): {query}")
             return rows[0]
 
-        # 2. Artist + title split
+        # 2. Artist + title split — use * wildcards (PostgREST ilike syntax, NOT %)
         parts = re.split(r'\s*-\s*', q, maxsplit=1)
         if len(parts) == 2:
             artist, title = parts[0].strip(), parts[1].strip()
-            url = f"{SUPABASE_TABLE}?artist=ilike.%{artist}%&title=ilike.%{title}%&limit=1"
-            log(f"[SUPABASE] Fallback URL: {url}")
+            params = {
+                "artist": f"ilike.*{artist}*",
+                "title":  f"ilike.*{title}*",
+                "limit":  1,
+            }
+            log(f"[SUPABASE] Fallback params: {params}")
 
-            resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=5)
+            resp = requests.get(SUPABASE_TABLE, headers=SUPABASE_HEADERS, params=params, timeout=5)
             log(f"[SUPABASE] Fallback status: {resp.status_code}")
 
             if resp.status_code == 401:
                 log(f"[SUPABASE] ❌ 401 UNAUTHORIZED on fallback")
-                return None
-            if resp.status_code != 200:
-                log(f"[SUPABASE] ❌ Unexpected status on fallback: {resp.status_code}")
                 return None
 
             rows = resp.json()
@@ -142,6 +137,7 @@ def supabase_save(query: str, file_id: str, content_type: str):
 
         log(f"[SUPABASE] Saving row: {row}")
         log(f"[SUPABASE] Save URL: {SUPABASE_TABLE}")
+        log(f"[SUPABASE] Headers: {headers}")
 
         resp = requests.post(SUPABASE_TABLE, headers=headers, json=row, timeout=10)
 
@@ -284,7 +280,7 @@ def get_audio_stream(video_url: str):
         if not audio:
             return None, None
         audio.sort(key=lambda x: x.get('abr') or x.get('tbr') or 0, reverse=True)
-    best = audio[0]
+        best = audio[0]
         ct = _MIME.get(best.get('ext', ''), 'audio/webm')
         return best['url'], ct
 
