@@ -12,11 +12,13 @@ app = Flask(__name__)
 # ── Supabase REST config ──────────────────────────────────────────────────
 SUPABASE_URL = "https://bzlbyagjpblzgeiixyud.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ6bGJ5YWdqcGJsemdlaWl4eXVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzMzMDEwMTYsImV4cCI6MjA4ODg3NzAxNn0.HJp0_O2jf286nFwaQwecn0M1OIuNu9TDz_S3RBwXDZM"
+
+# FIX: Only send apikey header. DO NOT send Authorization header with anon key.
+# When both are present, Kong prioritizes Authorization and rejects it as invalid JWT.
 SUPABASE_HEADERS = {
-    "apikey":        SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type":  "application/json",
-    "Accept":        "application/json",
+    "apikey":       SUPABASE_KEY,
+    "Content-Type": "application/json",
+    "Accept":       "application/vnd.pgrst.object+json, application/json",
 }
 SUPABASE_TABLE = f"{SUPABASE_URL}/rest/v1/songs"
 
@@ -70,7 +72,11 @@ def supabase_lookup(query: str) -> dict | None:
         log(f"[SUPABASE] Lookup status: {resp.status_code}")
 
         if resp.status_code == 401:
-            log(f"[SUPABASE] ❌ 401 UNAUTHORIZED — Check your API key or RLS settings")
+            log(f"[SUPABASE] ❌ 401 UNAUTHORIZED")
+            log(f"[SUPABASE] Response body: {resp.text}")
+            return None
+        if resp.status_code != 200:
+            log(f"[SUPABASE] ❌ Unexpected status: {resp.status_code}")
             log(f"[SUPABASE] Response: {resp.text}")
             return None
 
@@ -93,6 +99,9 @@ def supabase_lookup(query: str) -> dict | None:
 
             if resp.status_code == 401:
                 log(f"[SUPABASE] ❌ 401 UNAUTHORIZED on fallback")
+                return None
+            if resp.status_code != 200:
+                log(f"[SUPABASE] ❌ Unexpected status on fallback: {resp.status_code}")
                 return None
 
             rows = resp.json()
@@ -133,7 +142,6 @@ def supabase_save(query: str, file_id: str, content_type: str):
 
         log(f"[SUPABASE] Saving row: {row}")
         log(f"[SUPABASE] Save URL: {SUPABASE_TABLE}")
-        log(f"[SUPABASE] Headers: {headers}")
 
         resp = requests.post(SUPABASE_TABLE, headers=headers, json=row, timeout=10)
 
@@ -276,7 +284,7 @@ def get_audio_stream(video_url: str):
         if not audio:
             return None, None
         audio.sort(key=lambda x: x.get('abr') or x.get('tbr') or 0, reverse=True)
-        best = audio[0]
+    best = audio[0]
         ct = _MIME.get(best.get('ext', ''), 'audio/webm')
         return best['url'], ct
 
