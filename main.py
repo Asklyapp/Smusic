@@ -248,7 +248,6 @@ def _tee_stream(stream_url: str, content_type: str, query: str, cache_key: str):
     pipe_chunks = []
     pipe_lock   = threading.Lock()
     pipe_done   = threading.Event()
-    pipe_ok     = [True]   # flipped to False on client disconnect
 
     def uploader():
         buf = io.BytesIO()
@@ -268,14 +267,10 @@ def _tee_stream(stream_url: str, content_type: str, query: str, cache_key: str):
                 break
             time.sleep(0.01)
 
-        if pipe_ok[0]:
-            log(f"[TEE] ✅ Complete ({buf.tell():,} bytes), uploading to Telegram")
-            _upload_to_telegram(buf, query, cache_key, content_type)
-        else:
-            log(f"[TEE] ⚠️ Client disconnected early, discarding upload")
-            buf.close()
-            with _upload_lock:
-                _uploading.discard(cache_key)
+        # Always upload — even if the client disconnected early.
+        # The download runs to completion in generate() regardless.
+        log(f"[TEE] ✅ Complete ({buf.tell():,} bytes), uploading to Telegram")
+        _upload_to_telegram(buf, query, cache_key, content_type)
 
     if should_upload:
         threading.Thread(target=uploader, daemon=True).start()
@@ -289,7 +284,7 @@ def _tee_stream(stream_url: str, content_type: str, query: str, cache_key: str):
                             pipe_chunks.append(chunk)
                     yield chunk
         except GeneratorExit:
-            pipe_ok[0] = False   # client disconnected
+            pass   # client disconnected — download continues until pipe_done
         finally:
             yt.close()
             pipe_done.set()
