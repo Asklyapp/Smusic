@@ -183,7 +183,7 @@ def search_youtube_music(query: str):
 def get_audio_stream(video_url: str):
     import yt_dlp
     opts = {
-        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
         'quiet': True, 'skip_download': True,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
