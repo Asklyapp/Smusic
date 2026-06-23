@@ -33,13 +33,10 @@ def log(msg: str):
     print(msg, flush=True)
 
 
-# ── In-memory CDN URL cache ───────────────────────────────────────────────
-# Stores YouTube CDN URLs (which expire). Cleared when a song is uploaded to
-# Telegram so the next request routes through Supabase → Telegram instead.
-
+# ── In-memory URL cache ───────────────────────────────────────────────────
 _cache: dict = {}
 _cache_lock = threading.Lock()
-CACHE_TTL = 2 * 3600   # 2 h — YouTube URLs expire, so keep TTL short
+CACHE_TTL = 2 * 3600
 
 
 def _cache_get(key: str):
@@ -61,15 +58,14 @@ def _cache_del(key: str):
 
 
 # ── Upload queue ──────────────────────────────────────────────────────────
-# Completely independent from streaming. Items: (query, cache_key, file_bytes, content_type)
-# Processed one at a time by a single daemon thread. Songs are added here the
-# moment their download finishes — no matter if every client disconnected.
+# Completely independent from streaming.
+# Items: (query, cache_key, file_bytes, content_type)
+# One daemon thread processes uploads one at a time, forever.
 
 _upload_queue: queue.Queue = queue.Queue()
 
 
 def _upload_worker():
-    """Single daemon thread — processes uploads sequentially, forever."""
     while True:
         query, cache_key, file_bytes, content_type = _upload_queue.get()
         try:
@@ -95,40 +91,37 @@ def _do_upload(query: str, cache_key: str, file_bytes: bytes, content_type: str)
     ext = ('m4a'  if 'mp4'  in content_type else
            'webm' if 'webm' in content_type else
            'mp3'  if 'mpeg' in content_type else 'm4a')
-    fname = f"{query.replace(' ', '_')}.{ext}"
 
     log(f"[UPLOAD] ⬆️  Uploading to Telegram: {query} ({size:,} bytes)")
     buf = io.BytesIO(file_bytes)
-    file_id, err = telegram_upload_buffer(buf, filename=fname)
+    file_id, err = telegram_upload_buffer(buf, filename=f"{query.replace(' ', '_')}.{ext}")
 
     if err:
         log(f"[UPLOAD] ❌ Telegram upload failed: {err}")
         return
 
+    # Telegram success → save to Supabase, then clear stale memory cache
     log(f"[UPLOAD] ✅ Telegram done — saving to Supabase: {query}")
     supabase_save(query, file_id, content_type)
-
-    # Clear the memory cache so the next request routes through Supabase → Telegram
-    # instead of the (now-stale) YouTube CDN URL.
     _cache_del(cache_key)
-    log(f"[UPLOAD] 🗑️  Memory cache cleared for: {query}")
+    log(f"[UPLOAD] 🗑️  Memory cache cleared: {query}")
 
 
-# ── In-progress download registry ────────────────────────────────────────
-# Tracks songs currently being downloaded. Additional clients that request the
-# same song while it's downloading join the same DownloadState instead of
-# starting a new download.
+# ── In-progress resolve registry ──────────────────────────────────────────
+# Tracks songs currently being resolved via yt-dlp.
+# Multiple clients that request the same song share the resolved URL
+# so yt-dlp runs only once per song, but each client opens its own
+# direct proxy connection (original streaming behavior).
 
-class DownloadState:
-    def __init__(self, content_type: str = 'audio/mp4'):
-        self.chunks: list[bytes] = []
-        self.lock = threading.Lock()
-        self.done = threading.Event()
-        self.content_type = content_type
+class ResolveState:
+    def __init__(self):
+        self.stream_url: str | None = None
+        self.content_type: str = 'audio/mp4'
+        self.resolved = threading.Event()   # set when URL is ready (or failed)
         self.error: str | None = None
 
 
-_in_progress: dict[str, DownloadState] = {}
+_in_progress: dict[str, ResolveState] = {}
 _in_progress_lock = threading.Lock()
 
 
@@ -191,11 +184,7 @@ def supabase_save(query: str, file_id: str, content_type: str):
 
 def telegram_get_stream_url(file_id: str) -> str | None:
     try:
-        resp = requests.get(
-            f"{TELEGRAM_API}/getFile",
-            params={"file_id": file_id},
-            timeout=10,
-        )
+        resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
         result = resp.json()
         if result.get("ok"):
             return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{result['result']['file_path']}"
@@ -274,7 +263,6 @@ def get_audio_stream(video_url: str):
 
 
 def resolve_youtube(query: str):
-    """Returns (stream_url, content_type) or (None, None)."""
     if re.match(r'https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+', query):
         video_url = query
     else:
@@ -284,84 +272,77 @@ def resolve_youtube(query: str):
     return get_audio_stream(video_url)
 
 
-# ── Download + broadcast ──────────────────────────────────────────────────
+# ── Background resolve + upload download ──────────────────────────────────
 
-def _resolve_and_download(query: str, cache_key: str, state: DownloadState):
+def _resolve_and_prepare(query: str, cache_key: str, state: ResolveState):
     """
-    Runs in its own thread.
-    Step 1: Resolve the yt-dlp stream URL (slow — 5-15 s).
-    Step 2: Download the audio, appending chunks to state so streaming clients
-            can read them live.
-    Step 3: Queue the full file for Telegram upload — independently of whether
-            any client is still connected.
+    Background thread:
+    1. Runs yt-dlp to get the direct stream URL → sets state.resolved
+       so any waiting streaming generators can open their direct proxy connection.
+    2. Independently downloads the full file for Telegram upload.
+       This is separate from what the client streams — the upload always
+       completes even if all clients disconnect.
     """
-    # Step 1 — resolve
     stream_url, ct = resolve_youtube(query)
+
     if not stream_url:
-        log(f"[DOWNLOAD] ❌ No stream URL found for: '{query}'")
+        log(f"[RESOLVE] ❌ No stream URL: '{query}'")
         state.error = "No audio stream found"
-        state.done.set()
+        state.resolved.set()
         with _in_progress_lock:
             _in_progress.pop(cache_key, None)
         return
 
     ct = ct or 'audio/mp4'
+    state.stream_url = stream_url
     state.content_type = ct
-    log(f"[DOWNLOAD] 🎵 Resolved '{query}' → {ct}")
+    state.resolved.set()   # ← streaming generators unblock here
+    log(f"[RESOLVE] ✅ Resolved: '{query}' ({ct})")
 
-    # Step 2 — download and broadcast chunks
+    # Download full file independently for upload queue
     buf = io.BytesIO()
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
         resp = requests.get(stream_url, headers=headers, stream=True, timeout=(10, None))
         for chunk in resp.iter_content(chunk_size=CHUNK):
             if chunk:
-                with state.lock:
-                    state.chunks.append(chunk)
                 buf.write(chunk)
         resp.close()
-
         file_bytes = buf.getvalue()
         log(f"[DOWNLOAD] ✅ Complete: '{query}' ({len(file_bytes):,} bytes) — queuing upload")
-
-        # Step 3 — queue upload (independent; runs even if clients disconnected)
         _upload_queue.put((query, cache_key, file_bytes, ct))
-
     except Exception as exc:
-        log(f"[DOWNLOAD] ❌ Error: '{query}' — {exc}")
-        state.error = str(exc)
+        log(f"[DOWNLOAD] ❌ Failed: '{query}' — {exc}")
     finally:
         buf.close()
-        state.done.set()
         with _in_progress_lock:
             _in_progress.pop(cache_key, None)
 
 
-def _stream_from_state(state: DownloadState):
-    """
-    Generator that yields chunks from a DownloadState as they arrive.
-    Multiple clients can call this simultaneously with their own idx —
-    they all read from the same shared chunk list without interfering.
-    Waits for chunks while the download is in progress.
-    """
-    idx = 0
-    while True:
-        with state.lock:
-            available = state.chunks[idx:]
+# ── Streaming generator (original direct-proxy behavior) ──────────────────
 
-        for chunk in available:
-            yield chunk
-        idx += len(available)
+def _stream_direct(state: ResolveState):
+    """
+    Waits for yt-dlp resolution, then opens a direct HTTP proxy connection
+    to the YouTube CDN — exactly the same as original streaming behavior.
+    Each client gets its own independent connection.
+    """
+    state.resolved.wait()   # blocks until URL is ready (or failed)
 
-        if state.done.is_set():
-            # Drain any chunks written right before done was set
-            with state.lock:
-                final = state.chunks[idx:]
-            for chunk in final:
+    if state.error or not state.stream_url:
+        log(f"[STREAM] ❌ Cannot stream — resolution failed")
+        return
+
+    log(f"[STREAM] 📡 Opening direct proxy connection")
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
+        resp = requests.get(state.stream_url, headers=headers, stream=True, timeout=(10, None))
+        for chunk in resp.iter_content(chunk_size=CHUNK):
+            if chunk:
                 yield chunk
-            break
-
-        time.sleep(0.02)
+        resp.close()
+    except Exception as exc:
+        log(f"[STREAM] ❌ Proxy error: {exc}")
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -371,7 +352,7 @@ def home():
     return (
         f"SlurpMusic Server\n"
         f"Upload queue depth : {_upload_queue.qsize()}\n"
-        f"Active downloads   : {len(_in_progress)}\n"
+        f"Active resolves    : {len(_in_progress)}\n"
     ), 200
 
 
@@ -384,25 +365,13 @@ def get_audio():
     cache_key = query.lower()
     log(f"\n[AUDIO] ▶️  Request: '{query}'")
 
-    # 1. Check in-memory URL cache (fastest path — YouTube CDN redirect)
+    # 1. Memory cache → redirect (YouTube CDN or Telegram CDN)
     cached_url, cached_ct = _cache_get(cache_key)
     if cached_url:
         log(f"[AUDIO] ✅ Memory cache hit: '{query}'")
         return redirect(cached_url, code=302)
 
-    # 2. Check if song is already being downloaded → join that download
-    with _in_progress_lock:
-        if cache_key in _in_progress:
-            state = _in_progress[cache_key]
-            log(f"[AUDIO] 🔗 Joining in-progress download: '{query}'")
-            return Response(
-                stream_with_context(_stream_from_state(state)),
-                status=200,
-                content_type=state.content_type,
-                headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'},
-            )
-
-    # 3. Check Supabase (fast ~200 ms) — already uploaded to Telegram?
+    # 2. Check Supabase (fast ~200 ms)
     row = supabase_lookup(query)
     if row:
         tg_url = telegram_get_stream_url(row["file_id"])
@@ -413,30 +382,36 @@ def get_audio():
             return redirect(tg_url, code=302)
         log(f"[AUDIO] ⚠️  Supabase row found but Telegram URL failed — re-downloading")
 
-    # 4. Not cached anywhere. Register a DownloadState NOW and return the
-    #    streaming response IMMEDIATELY so AVPlayer doesn't time out waiting
-    #    for yt-dlp to resolve (which can take 5-15 seconds).
-    state = DownloadState(content_type='audio/mp4')
+    # 3. Check if already being resolved → join (shares the resolved URL,
+    #    each client still opens its own direct proxy connection)
     with _in_progress_lock:
-        # Double-check — another thread might have started a download between
-        # the check above and acquiring the lock now.
         if cache_key in _in_progress:
             state = _in_progress[cache_key]
-            log(f"[AUDIO] 🔗 Joining in-progress download (late): '{query}'")
-        else:
-            _in_progress[cache_key] = state
-            # Start resolve + download entirely in the background.
-            # The streaming response below will wait for chunks as they arrive.
-            threading.Thread(
-                target=_resolve_and_download,
-                args=(query, cache_key, state),
-                daemon=True,
-                name=f"dl-{cache_key[:20]}",
-            ).start()
-            log(f"[AUDIO] 🚀 New stream started: '{query}' (response sent immediately)")
+            log(f"[AUDIO] 🔗 Joining in-progress resolve: '{query}'")
+            return Response(
+                stream_with_context(_stream_direct(state)),
+                status=200,
+                content_type='audio/mp4',
+                headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'},
+            )
 
+        # 4. New song — register ResolveState and return response IMMEDIATELY.
+        #    The streaming generator blocks inside _stream_direct waiting for
+        #    state.resolved, so AVPlayer gets its 200 OK right away and waits
+        #    for data rather than timing out.
+        state = ResolveState()
+        _in_progress[cache_key] = state
+
+    threading.Thread(
+        target=_resolve_and_prepare,
+        args=(query, cache_key, state),
+        daemon=True,
+        name=f"resolve-{cache_key[:20]}",
+    ).start()
+
+    log(f"[AUDIO] 🚀 New request: '{query}' — response sent immediately, resolving in background")
     return Response(
-        stream_with_context(_stream_from_state(state)),
+        stream_with_context(_stream_direct(state)),
         status=200,
         content_type='audio/mp4',
         headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'},
