@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import queue
 import threading
 import io
 import requests
@@ -25,9 +26,73 @@ CHAT_ID      = "-1003992096916"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
-# ── Upload tracking ───────────────────────────────────────────────────────
-_uploading: set = set()
-_upload_lock = threading.Lock()
+CHUNK = 8 * 1024
+
+
+def log(msg: str):
+    print(msg, flush=True)
+
+
+# ── Upload queue ──────────────────────────────────────────────────────────
+# Completely independent from streaming. Songs are added here the moment
+# their download completes, regardless of whether any client is still listening.
+
+_upload_queue: queue.Queue = queue.Queue()
+
+
+def _upload_worker():
+    """Single daemon thread — processes uploads one at a time, forever."""
+    while True:
+        query, file_bytes, content_type = _upload_queue.get()
+        try:
+            _do_upload(query, file_bytes, content_type)
+        except Exception as exc:
+            log(f"[UPLOAD WORKER] ❌ {exc}")
+        finally:
+            _upload_queue.task_done()
+
+
+threading.Thread(target=_upload_worker, daemon=True, name="upload-worker").start()
+
+
+def _do_upload(query: str, file_bytes: bytes, content_type: str):
+    size = len(file_bytes)
+    if size < 1024:
+        log(f"[UPLOAD] ❌ Too small ({size} bytes), skipping: {query}")
+        return
+    if size > TELEGRAM_MAX_BYTES:
+        log(f"[UPLOAD] ❌ Too large ({size:,} bytes), skipping: {query}")
+        return
+    ext = ('m4a'  if 'mp4'  in content_type else
+           'webm' if 'webm' in content_type else
+           'mp3'  if 'mpeg' in content_type else 'm4a')
+    buf = io.BytesIO(file_bytes)
+    log(f"[UPLOAD] ⬆️  Uploading: {query} ({size:,} bytes)")
+    file_id, err = telegram_upload_buffer(buf, filename=f"{query.replace(' ', '_')}.{ext}")
+    if err:
+        log(f"[UPLOAD] ❌ Failed: {err}")
+    else:
+        log(f"[UPLOAD] ✅ Done: {query} — saving to Supabase")
+        supabase_save(query, file_id, content_type)
+
+
+# ── In-progress download registry ────────────────────────────────────────
+# When a song is being downloaded, all clients share the same DownloadState.
+# A new client just subscribes to the existing state instead of starting
+# a second download.
+
+class DownloadState:
+    def __init__(self, content_type: str = 'audio/mp4'):
+        self.chunks: list[bytes] = []
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.content_type = content_type
+        self.error: str | None = None
+
+
+_in_progress: dict[str, DownloadState] = {}
+_in_progress_lock = threading.Lock()
+
 
 # ── In-memory CDN URL cache ───────────────────────────────────────────────
 _cache: dict = {}
@@ -39,16 +104,13 @@ def _cache_get(key: str):
     with _cache_lock:
         e = _cache.get(key)
         if e and time.time() - e['ts'] < CACHE_TTL:
-            return e['url'], e.get('ct', 'audio/webm')
+            return e['url'], e.get('ct', 'audio/mp4')
     return None, None
 
-def _cache_set(key: str, url: str, ct: str = 'audio/webm'):
+
+def _cache_set(key: str, url: str, ct: str = 'audio/mp4'):
     with _cache_lock:
         _cache[key] = {'url': url, 'ts': time.time(), 'ct': ct}
-
-
-def log(msg: str):
-    print(msg, flush=True)
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────
@@ -109,7 +171,7 @@ def telegram_get_stream_url(file_id: str) -> str | None:
         return None
 
 
-def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"):
+def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.m4a"):
     file_buffer.seek(0)
     resp = requests.post(
         f"{TELEGRAM_API}/sendDocument",
@@ -123,32 +185,6 @@ def telegram_upload_buffer(file_buffer: io.BytesIO, filename: str = "audio.webm"
     return None, result.get("description", "unknown error")
 
 
-def _upload_to_telegram(buffer: io.BytesIO, query: str, cache_key: str, content_type: str):
-    try:
-        size = buffer.tell()
-        if size < 1024:
-            log(f"[TELEGRAM] ❌ Too small ({size} bytes), skipping")
-            return
-        if size > TELEGRAM_MAX_BYTES:
-            log(f"[TELEGRAM] ❌ Too large ({size:,} bytes), skipping")
-            return
-        ext = ('webm' if 'webm' in content_type else
-               'm4a'  if 'mp4'  in content_type else
-               'mp3'  if 'mpeg' in content_type else 'webm')
-        file_id, err = telegram_upload_buffer(buffer, filename=f"{query.replace(' ', '_')}.{ext}")
-        if err:
-            log(f"[TELEGRAM] ❌ Upload failed: {err}")
-        else:
-            log(f"[TELEGRAM] ✅ Uploaded! file_id={file_id}")
-            supabase_save(query, file_id, content_type)
-    except Exception as exc:
-        log(f"[TELEGRAM] ❌ Exception: {exc}")
-    finally:
-        buffer.close()
-        with _upload_lock:
-            _uploading.discard(cache_key)
-
-
 # ── yt-dlp helpers ────────────────────────────────────────────────────────
 YTMUSIC_AVAILABLE = False
 try:
@@ -160,6 +196,7 @@ except ImportError:
 
 _MIME = {'webm': 'audio/webm', 'm4a': 'audio/mp4',
          'mp4': 'audio/mp4', 'ogg': 'audio/ogg', 'mp3': 'audio/mpeg'}
+
 
 def search_youtube_music(query: str):
     if YTMUSIC_AVAILABLE:
@@ -196,7 +233,7 @@ def get_audio_stream(video_url: str):
             return None, None
         audio.sort(key=lambda x: x.get('abr') or x.get('tbr') or 0, reverse=True)
         best = audio[0]
-        ct = _MIME.get(best.get('ext', ''), 'audio/webm')
+        ct = _MIME.get(best.get('ext', ''), 'audio/mp4')
         return best['url'], ct
 
 
@@ -213,119 +250,80 @@ def resolve_youtube(query: str, cache_key: str):
     return url, ct
 
 
-# ── Tee streaming ─────────────────────────────────────────────────────────
-CHUNK = 8 * 1024
+# ── Download + broadcast ──────────────────────────────────────────────────
 
-
-def _tee_stream(stream_url: str, content_type: str, query: str, cache_key: str):
+def _download_and_broadcast(stream_url: str, content_type: str,
+                             query: str, cache_key: str, state: DownloadState):
     """
-    One YouTube request. Two things happen in parallel:
-      1. Chunks are yielded to the browser immediately (streaming)
-      2. The same chunks are written into a pipe that a background
-         thread reads from and uploads to Telegram — concurrently,
-         not after streaming finishes.
-
-    The browser never waits for Telegram. Telegram never waits for
-    the browser to finish. They run independently from one download.
+    Runs in its own thread. Downloads the full audio from stream_url,
+    appending every chunk to state.chunks so streaming clients can read them.
+    When done (success or failure), sets state.done and removes from _in_progress.
+    On success, queues the full file for Telegram upload — completely independent
+    of whether any client is still connected.
     """
     upstream_headers = {'User-Agent': 'Mozilla/5.0 (compatible; audio-proxy/1.0)'}
-    # Strip Range header — we always fetch the full file so the tee buffer is complete.
-    # The browser gets the full stream and handles seeking client-side.
-    yt = requests.get(stream_url, headers=upstream_headers, stream=True, timeout=(5, None))
-
-    resp_headers = {
-        'Content-Type':                content_type,
-        'Accept-Ranges':               'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control':               'no-store',
-    }
-    if 'Content-Length' in yt.headers:
-        resp_headers['Content-Length'] = yt.headers['Content-Length']
-
-    # Decide whether to upload — skip if already in progress
-    should_upload = False
-    with _upload_lock:
-        if cache_key not in _uploading:
-            _uploading.add(cache_key)
-            should_upload = True
-
-    # Pipe: stream generator writes chunks here; uploader thread reads them
-    # We use a list as a shared queue + an Event to signal completion/abort
-    pipe_chunks = []
-    pipe_lock   = threading.Lock()
-    pipe_done   = threading.Event()   # set when download finishes or aborts
-    pipe_ok     = [True]              # flipped to False on client disconnect
-
-    def uploader():
-        """Runs in background: drains pipe_chunks and uploads to Telegram."""
-        buf = io.BytesIO()
-        idx = 0
-        while True:
-            # Grab any new chunks
-            with pipe_lock:
-                new = pipe_chunks[idx:]
-            for chunk in new:
+    buf = io.BytesIO()
+    try:
+        yt = requests.get(stream_url, headers=upstream_headers, stream=True, timeout=(5, None))
+        for chunk in yt.iter_content(chunk_size=CHUNK):
+            if chunk:
+                with state.lock:
+                    state.chunks.append(chunk)
                 buf.write(chunk)
-            idx += len(new)
+        yt.close()
 
-            if pipe_done.is_set():
-                # Drain any final chunks added right before done was set
-                with pipe_lock:
-                    new = pipe_chunks[idx:]
-                for chunk in new:
-                    buf.write(chunk)
-                break
-            time.sleep(0.01)  # tight poll — negligible CPU
+        file_bytes = buf.getvalue()
+        log(f"[DOWNLOAD] ✅ Complete: '{query}' ({len(file_bytes):,} bytes) — queuing upload")
+        _upload_queue.put((query, file_bytes, content_type))
 
-        if pipe_ok[0]:
-            log(f"[TEE] ✅ Tee complete ({buf.tell():,} bytes), uploading to Telegram")
-            _upload_to_telegram(buf, query, cache_key, content_type)
-        else:
-            log(f"[TEE] ⚠️ Client disconnected early, discarding upload")
-            buf.close()
-            with _upload_lock:
-                _uploading.discard(cache_key)
+    except Exception as exc:
+        log(f"[DOWNLOAD] ❌ Failed: '{query}' — {exc}")
+        state.error = str(exc)
+    finally:
+        buf.close()
+        state.done.set()
+        with _in_progress_lock:
+            _in_progress.pop(cache_key, None)
 
-    if should_upload:
-        threading.Thread(target=uploader, daemon=True).start()
 
-    def generate():
-        try:
-            for chunk in yt.iter_content(chunk_size=CHUNK):
-                if chunk:
-                    if should_upload:
-                        with pipe_lock:
-                            pipe_chunks.append(chunk)
-                    yield chunk
-        except GeneratorExit:
-            pipe_ok[0] = False  # client disconnected
-        finally:
-            yt.close()
-            pipe_done.set()
+def _stream_from_state(state: DownloadState):
+    """
+    Generator that yields chunks from a DownloadState as they arrive.
+    Works for any number of simultaneous clients — they all read from
+    the same chunk list independently using their own index.
+    """
+    idx = 0
+    while True:
+        with state.lock:
+            new = state.chunks[idx:]
+        for chunk in new:
+            yield chunk
+        idx += len(new)
 
-    return Response(
-        stream_with_context(generate()),
-        status=200,
-        headers=resp_headers,
-    )
+        if state.done.is_set():
+            # Drain any final chunks written right before done was set
+            with state.lock:
+                final = state.chunks[idx:]
+            for chunk in final:
+                yield chunk
+            break
+
+        time.sleep(0.01)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def home():
-    return "Usage: GET /audio?q=Artist+-+Song+Title", 200
+    q_depth = _upload_queue.qsize()
+    in_prog  = len(_in_progress)
+    return (f"SlurpMusic Server\n"
+            f"Upload queue depth: {q_depth}\n"
+            f"Active downloads:   {in_prog}\n"), 200
 
 
 @app.route('/audio', methods=['GET', 'HEAD'])
 def get_audio():
-    """
-    Everything runs in parallel — nothing waits for anything:
-      - Supabase lookup fires immediately
-      - yt-dlp resolution fires immediately
-      - If Supabase hits → redirect (yt-dlp result discarded)
-      - If Supabase misses → tee-stream from YouTube
-    """
     query = request.args.get('q', '').strip()
     if not query:
         return "Error: missing q parameter", 400
@@ -333,6 +331,25 @@ def get_audio():
     cache_key = query.lower()
     log(f"[AUDIO] Request: '{query}'")
 
+    # 1. Check in-memory CDN cache (fastest path)
+    cached_url, cached_ct = _cache_get(cache_key)
+    if cached_url:
+        log(f"[AUDIO] ✅ Memory cache hit: '{query}'")
+        return redirect(cached_url, code=302)
+
+    # 2. Check if this song is already being downloaded — join it
+    with _in_progress_lock:
+        if cache_key in _in_progress:
+            state = _in_progress[cache_key]
+            log(f"[AUDIO] 🔗 Joining in-progress download: '{query}'")
+            return Response(
+                stream_with_context(_stream_from_state(state)),
+                status=200,
+                content_type=state.content_type,
+                headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'},
+            )
+
+    # 3. Supabase + YouTube resolution run in parallel
     supabase_result = [None]
     youtube_result  = [None, None]
     supabase_done   = threading.Event()
@@ -343,36 +360,65 @@ def get_audio():
         supabase_done.set()
 
     def do_youtube():
-        url, ct = _cache_get(cache_key)
-        if not url:
-            try:
-                url, ct = resolve_youtube(query, cache_key)
-            except Exception as exc:
-                log(f"[YOUTUBE] ❌ {exc}")
+        url, ct = resolve_youtube(query, cache_key)
         youtube_result[0], youtube_result[1] = url, ct
         youtube_done.set()
 
     threading.Thread(target=do_supabase, daemon=True).start()
     threading.Thread(target=do_youtube,  daemon=True).start()
 
-    # Wait for Supabase first (fast) — if it hits, we're done instantly
+    # Supabase is fast — check it first
     supabase_done.wait()
     row = supabase_result[0]
     if row:
         tg_url = telegram_get_stream_url(row["file_id"])
         if tg_url:
-            log(f"[AUDIO] ✅ Telegram CDN hit: {query}")
+            ct = row.get("content_type", "audio/mp4")
+            _cache_set(cache_key, tg_url, ct)
+            log(f"[AUDIO] ✅ Telegram hit: '{query}'")
+            youtube_done.wait()  # let yt thread finish cleanly
             return redirect(tg_url, code=302)
         log(f"[AUDIO] Telegram URL failed, falling through to YouTube")
 
-    # Supabase missed — wait for yt-dlp (already running in parallel)
+    # 4. Wait for YouTube resolution
     youtube_done.wait()
     stream_url, ct = youtube_result[0], youtube_result[1]
     if not stream_url:
         return "Error: no audio stream found", 404
 
-    log(f"[AUDIO] Tee-streaming: '{query}'")
-    return _tee_stream(stream_url, ct or 'audio/webm', query, cache_key)
+    ct = ct or 'audio/mp4'
+
+    # 5. Register download state — must happen inside the lock to prevent
+    #    a race where two requests both miss the in-progress check above
+    with _in_progress_lock:
+        # Re-check in case another request sneaked in between step 2 and here
+        if cache_key in _in_progress:
+            state = _in_progress[cache_key]
+            log(f"[AUDIO] 🔗 Joining in-progress download (late): '{query}'")
+            return Response(
+                stream_with_context(_stream_from_state(state)),
+                status=200,
+                content_type=state.content_type,
+                headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'},
+            )
+        state = DownloadState(content_type=ct)
+        _in_progress[cache_key] = state
+
+    # 6. Start background downloader — completely independent of streaming
+    threading.Thread(
+        target=_download_and_broadcast,
+        args=(stream_url, ct, query, cache_key, state),
+        daemon=True,
+        name=f"dl-{cache_key[:20]}",
+    ).start()
+
+    log(f"[AUDIO] 🚀 New download + stream: '{query}'")
+    return Response(
+        stream_with_context(_stream_from_state(state)),
+        status=200,
+        content_type=ct,
+        headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'},
+    )
 
 
 if __name__ == '__main__':
