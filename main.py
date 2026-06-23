@@ -244,22 +244,21 @@ def search_youtube_music(query: str):
 
 def get_audio_stream(video_url: str):
     import yt_dlp
+    # bestaudio[ext=m4a] → best m4a audio-only stream (what AVPlayer loves)
+    # bestaudio          → any audio-only stream as fallback
+    # Never falls back to video+audio formats.
     opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio',
         'quiet': True, 'skip_download': True,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
-        fmts = info.get('formats', [])
-        audio = [f for f in fmts if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-        if not audio:
-            audio = [f for f in fmts if f.get('acodec') != 'none']
-        if not audio:
+        url = info.get('url')
+        if not url:
             return None, None
-        audio.sort(key=lambda x: x.get('abr') or x.get('tbr') or 0, reverse=True)
-        best = audio[0]
-        ct = _MIME.get(best.get('ext', ''), 'audio/mp4')
-        return best['url'], ct
+        ext = info.get('ext', 'm4a')
+        ct = _MIME.get(ext, 'audio/mp4')
+        return url, ct
 
 
 def resolve_youtube(query: str):
